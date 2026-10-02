@@ -8,10 +8,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"github.com/cloudreve/Cloudreve/v4/application/constants"
-	"github.com/cloudreve/Cloudreve/v4/pkg/logging"
-	"github.com/cloudreve/Cloudreve/v4/pkg/util"
-	"github.com/gin-contrib/static"
 	"io"
 	"io/fs"
 	"net/http"
@@ -20,6 +16,11 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/cloudreve/Cloudreve/v4/application/constants"
+	"github.com/cloudreve/Cloudreve/v4/pkg/logging"
+	"github.com/cloudreve/Cloudreve/v4/pkg/util"
+	"github.com/gin-contrib/static"
 )
 
 const StaticFolder = "statics"
@@ -50,12 +51,25 @@ func (b *GinFS) Exists(prefix string, filepath string) bool {
 }
 
 // NewServerStaticFS 初始化静态资源文件
+//
+// The external "statics" folder takes precedence over the embedded assets so an
+// operator can eject and patch the frontend without rebuilding the binary. A
+// folder that does not actually contain a usable index.html is not a valid
+// override: using it would make every non-API path fall through to a bare 404.
+// Such a folder is reported and ignored so the embedded assets keep serving.
 func NewServerStaticFS(l logging.Logger, statics fs.FS, isPro bool) (static.ServeFileSystem, error) {
 	var staticFS static.ServeFileSystem
-	if util.Exists(util.DataPath(StaticFolder)) {
-		l.Info("Folder with %q already exists, it will be used to serve static files.", util.DataPath(StaticFolder))
-		staticFS = static.LocalFile(util.DataPath(StaticFolder), false)
+	staticPath := util.DataPath(StaticFolder)
+
+	if util.Exists(staticPath) && util.Exists(filepath.Join(staticPath, "index.html")) {
+		l.Info("Folder with %q already exists, it will be used to serve static files.", staticPath)
+		staticFS = static.LocalFile(staticPath, false)
 	} else {
+		if util.Exists(staticPath) {
+			l.Warning("Folder %q exists but does not contain index.html, ignoring it and serving the embedded frontend instead. "+
+				"Re-run \"cloudreve eject\" or delete the folder to silence this warning.", staticPath)
+		}
+
 		// 初始化静态资源
 		embedFS, err := fs.Sub(statics, "assets/build")
 		if err != nil {

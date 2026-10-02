@@ -73,10 +73,16 @@ func FrontendFileHandler(dep dependency.Dep) gin.HandlerFunc {
 			return
 		}
 
-		if path == "/sw.js" || strings.HasPrefix(path, "/locales/") {
-			c.Header("Cache-Control", "public, no-cache")
-		} else if strings.HasPrefix(path, "/assets/") {
+		// Every hashed asset lives under /assets, so it can be cached forever.
+		// Anything else served from the static filesystem (version.json, the
+		// unhashed images under /static, favicon, ...) has a stable name and
+		// therefore must be revalidated: with no Cache-Control the browser
+		// applies heuristic freshness from Last-Modified and can keep serving a
+		// stale copy for a long time.
+		if strings.HasPrefix(path, "/assets/") {
 			c.Header("Cache-Control", "public, max-age=31536000")
+		} else {
+			c.Header("Cache-Control", "public, no-cache")
 		}
 
 		// 存在的静态文件

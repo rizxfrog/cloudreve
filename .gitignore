@@ -38,3 +38,4 @@ tmp/
 .devcontainer/
 cloudreve
 .DS_Store
+/.env.dev
