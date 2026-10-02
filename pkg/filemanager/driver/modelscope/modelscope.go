@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"regexp"
@@ -110,8 +111,20 @@ func New(ctx context.Context, policy *ent.StoragePolicy, settings setting.Provid
 	}, nil
 }
 
+// ErrDigestMismatch is returned when the content received does not hash to the
+// digest the client declared. The declared value decides the physical object
+// path, and content-addressed objects are shared between entities, so accepting
+// a mismatch would file content under a path that describes other bytes.
+var ErrDigestMismatch = errors.New("content does not match the declared hash")
+
 // Put stores the file content in ModelScope and rewrites the request's save
 // path to the resolved content-addressed object path.
+//
+// The object path derives from the SHA-256 of the content, so the digest is
+// needed before the content can be addressed. When the client supplies it, the
+// object is addressed up front and the content is streamed straight to storage
+// without being buffered. Without it the only way to learn the digest is to
+// read the whole stream, which falls back to a temporary file.
 func (d *Driver) Put(ctx context.Context, file *fs.UploadRequest) error {
 	defer file.Close()
 
@@ -122,6 +135,17 @@ func (d *Driver) Put(ctx context.Context, file *fs.UploadRequest) error {
 		return errors.New("ModelScope storage only supports whole-file uploads")
 	}
 
+	if declared := file.Props.ClientHash; declared != "" {
+		return d.putStreamed(ctx, file, declared)
+	}
+
+	return d.putBuffered(ctx, file)
+}
+
+// putBuffered reads the whole stream into a temporary file to learn the digest,
+// then stores it. It is the fallback for a client that cannot hash the content
+// before sending it.
+func (d *Driver) putBuffered(ctx context.Context, file *fs.UploadRequest) error {
 	temp, err := os.CreateTemp("", "cloudreve-modelscope-*")
 	if err != nil {
 		return fmt.Errorf("failed to create temporary file: %w", err)
@@ -151,6 +175,173 @@ func (d *Driver) Put(ctx context.Context, file *fs.UploadRequest) error {
 
 	// Record the resolved path so the manager can persist it onto the entity.
 	file.Props.SavePath = objectPath
+	return nil
+}
+
+// putStreamed stores the content described by declared without buffering it.
+//
+// The bytes are relayed to storage through a pipe that withholds the stream
+// until the digest has been verified, so a client cannot get content filed
+// under a path it does not hash to. The upstream PUT only receives data while
+// the pipe is open; a mismatch closes it with an error before any byte is
+// accepted, and the storage target is never committed.
+func (d *Driver) putStreamed(ctx context.Context, file *fs.UploadRequest, declared string) error {
+	size := file.Props.Size
+	objectPath := ObjectPath(d.ns, declared)
+
+	if size <= inlineLimit {
+		return d.putInlineStreamed(ctx, file, declared, objectPath, size)
+	}
+
+	// The probe is a deduplication shortcut whose failure must not abort an
+	// otherwise valid upload.
+	exists := false
+	if probed, err := d.client.Exists(ctx, objectPath); err != nil {
+		d.l.Warning("ModelScope object probe for %q failed, proceeding with upload: %s", objectPath, err)
+	} else {
+		exists = probed
+	}
+
+	if exists {
+		// Identical content already resolves to this object. The body is still
+		// read so the digest is verified before the caller's upload succeeds.
+		if err := drainAndVerify(file, size, declared); err != nil {
+			return err
+		}
+		return d.client.Commit(ctx, []map[string]any{blobAction(objectPath, declared, size)})
+	}
+
+	target, err := d.client.Validate(ctx, declared, size)
+	if err != nil {
+		return err
+	}
+
+	if target == "" {
+		// The blob is already stored upstream and only the pointer is missing.
+		if err := drainAndVerify(file, size, declared); err != nil {
+			return err
+		}
+		return d.client.Commit(ctx, []map[string]any{blobAction(objectPath, declared, size)})
+	}
+
+	// Relay the body to storage while hashing it. The bytes cannot be withheld
+	// until the digest is known, because that would mean buffering the whole
+	// upload, which is what this path exists to avoid. The guarantee comes from
+	// two places instead:
+	//
+	//   1. Storage itself rejects a blob whose digest does not match the oid it
+	//      was addressed with, so mismatched content is never stored.
+	//   2. The pointer is only committed after the digest is verified locally,
+	//      so no entity can ever reference an object it does not describe.
+	//
+	// A mismatch therefore aborts the transfer and skips the commit; nothing is
+	// left pointing at the wrong bytes.
+	pr, pw := io.Pipe()
+	hasher := sha256.New()
+	counted := &countingReader{r: io.TeeReader(io.LimitReader(file, size+1), hasher)}
+	relayed := make(chan error, 1)
+
+	go func() {
+		_, copyErr := io.Copy(pw, counted)
+
+		if copyErr == nil {
+			copyErr = verifyStreamed(counted, hasher, size, declared)
+		}
+
+		// Closing with the error aborts an in-flight PUT and makes storage
+		// discard whatever it received.
+		pw.CloseWithError(copyErr)
+		relayed <- copyErr
+	}()
+
+	putErr := d.client.Put(ctx, target, declared, pr, size)
+
+	// Put can return before the body is fully consumed, for example when
+	// storage answers an error early or the request fails to start. Closing the
+	// reader unblocks the relay goroutine, which would otherwise sit in a pipe
+	// write with no reader and never reach the channel below.
+	_ = pr.Close()
+
+	// The relay goroutine always reports its verdict, so this cannot block.
+	relayErr := <-relayed
+
+	if putErr != nil {
+		return putErr
+	}
+	if relayErr != nil {
+		return relayErr
+	}
+
+	if err := d.client.Commit(ctx, []map[string]any{blobAction(objectPath, declared, size)}); err != nil {
+		return err
+	}
+
+	file.Props.SavePath = objectPath
+	return nil
+}
+
+// putInlineStreamed handles an object small enough to be committed inline. Its
+// content travels inside the commit request, so the bytes are held in a bounded
+// buffer and the digest is checked before anything is sent.
+func (d *Driver) putInlineStreamed(ctx context.Context, file *fs.UploadRequest, declared, objectPath string, size int64) error {
+	hasher := sha256.New()
+	counted := &countingReader{r: io.TeeReader(io.LimitReader(file, size+1), hasher)}
+
+	content, err := io.ReadAll(counted)
+	if err != nil {
+		return fmt.Errorf("failed to read upload: %w", err)
+	}
+
+	if err := verifyStreamed(counted, hasher, size, declared); err != nil {
+		return err
+	}
+
+	if err := d.client.Commit(ctx, []map[string]any{inlineAction(objectPath, content)}); err != nil {
+		return err
+	}
+
+	file.Props.SavePath = objectPath
+	return nil
+}
+
+// drainAndVerify consumes the body and checks it against the declared digest.
+// Used on the paths that do not relay the bytes to storage, so the caller still
+// has to prove the content matches what it claimed.
+func drainAndVerify(file *fs.UploadRequest, size int64, declared string) error {
+	hasher := sha256.New()
+	counted := &countingReader{r: io.TeeReader(io.LimitReader(file, size+1), hasher)}
+
+	if _, err := io.Copy(io.Discard, counted); err != nil {
+		return fmt.Errorf("failed to read upload: %w", err)
+	}
+
+	return verifyStreamed(counted, hasher, size, declared)
+}
+
+// countingReader counts the bytes that passed through it.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// verifyStreamed rejects a stream whose length or digest does not match what
+// the client declared. A short or long stream is caught first so a truncated
+// upload is never committed.
+func verifyStreamed(counted *countingReader, hasher hash.Hash, size int64, declared string) error {
+	if counted.n != size {
+		return upstreamError("upload content", fmt.Errorf("declared %d bytes, received %d", size, counted.n))
+	}
+
+	if actual := hex.EncodeToString(hasher.Sum(nil)); actual != declared {
+		return fmt.Errorf("%w: declared %s, computed %s", ErrDigestMismatch, declared, actual)
+	}
+
 	return nil
 }
 

@@ -3,7 +3,9 @@ package explorer
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cloudreve/Cloudreve/v4/application/dependency"
@@ -31,6 +33,12 @@ type (
 		EntityType          string            `json:"entity_type" binding:"eq=|eq=live_photo|eq=version"`
 		EncryptionSupported []types.Cipher    `json:"encryption_supported"`
 		Previous            string            `json:"previous" form:"previous"`
+		// ClientHash is the lowercase hex SHA-256 the client computed for the
+		// content it is about to send. It lets a content-addressed handler
+		// resolve the object target before reading the stream instead of
+		// buffering the whole upload first. The server recomputes and verifies
+		// it while receiving, so it is a hint, never an authority.
+		ClientHash string `json:"client_hash"`
 	}
 )
 
@@ -77,6 +85,7 @@ func (service *CreateUploadSessionService) Create(c context.Context) (*UploadSes
 			PreferredStoragePolicy: policyId,
 			EncryptionSupported:    service.EncryptionSupported,
 			ClientSideEncrypted:    len(service.EncryptionSupported) > 0,
+			ClientHash:             normalizeClientHash(service.ClientHash),
 		},
 	}
 
@@ -236,4 +245,20 @@ func (service *DeleteUploadSessionService) Delete(c *gin.Context) error {
 	}
 
 	return m.CancelUploadSession(c, uri, service.ID)
+}
+
+// clientHashPattern matches a lowercase hex SHA-256 digest.
+var clientHashPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+
+// normalizeClientHash accepts a client supplied digest only in canonical form,
+// so a handler can compare it against the digest it computes later. An
+// unusable value is dropped rather than rejected: the client hash is an
+// optimisation, and the upload must still work when a client cannot provide
+// one (older clients, or a browser without a hashing worker).
+func normalizeClientHash(raw string) string {
+	candidate := strings.ToLower(strings.TrimSpace(raw))
+	if !clientHashPattern.MatchString(candidate) {
+		return ""
+	}
+	return candidate
 }

@@ -301,6 +301,14 @@ type (
 		ExpireAt            time.Time
 		EncryptionSupported []types.Cipher
 		ClientSideEncrypted bool // Whether the file stream is already encrypted by client side.
+		// ClientHash is the content digest the client claims for the upload,
+		// lowercase hex. A handler whose object path derives from the digest
+		// needs it before the content is read, so it can address the object
+		// without buffering the whole stream first. It is never trusted on its
+		// own: the receiving side recomputes the digest and rejects a mismatch,
+		// because the value decides the physical path of content-addressed
+		// storage.
+		ClientHash string
 	}
 
 	// FsOption options for underlying file system.

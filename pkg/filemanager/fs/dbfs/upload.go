@@ -257,6 +257,7 @@ func (f *DBFS) PrepareUpload(ctx context.Context, req *fs.UploadRequest, opts ..
 			EntityType:          req.Props.EntityType,
 			Metadata:            req.Props.Metadata,
 			ClientSideEncrypted: req.Props.ClientSideEncrypted,
+			ClientHash:          req.Props.ClientHash,
 		},
 		FileID:         fileId,
 		NewFileCreated: !fileExisted,

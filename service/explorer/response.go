@@ -305,6 +305,11 @@ type StoragePolicy struct {
 	Relay             bool             `json:"relay,omitempty"`
 	ChunkConcurrency  int              `json:"chunk_concurrency,omitempty"`
 	Encryption        bool             `json:"encryption,omitempty"`
+	// ClientHashRequired reports that this policy addresses objects by the hash
+	// of their content. A client should compute the hash before uploading so the
+	// server can address the object without buffering the whole file; without it
+	// the server still accepts the upload but must buffer it to learn the hash.
+	ClientHashRequired bool `json:"client_hash_required,omitempty"`
 }
 
 type Entity struct {
@@ -518,6 +523,10 @@ func BuildStoragePolicy(sp *ent.StoragePolicy, hasher hashid.Encoder) *StoragePo
 		Relay:            sp.Settings.Relay,
 		ChunkConcurrency: sp.Settings.ChunkConcurrency,
 		Encryption:       sp.Settings.Encryption,
+		// A content-addressed policy names the object after its digest, so a
+		// client that supplies the digest up front lets the server stream the
+		// upload instead of buffering it to compute the digest itself.
+		ClientHashRequired: types.PolicyType(sp.Type) == types.PolicyTypeModelScope,
 	}
 
 	if sp.Settings.IsFileTypeDenyList {
