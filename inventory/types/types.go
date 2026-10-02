@@ -105,6 +105,14 @@ type (
 		ChunkConcurrency int `json:"chunk_concurrency,omitempty"`
 		// Whether to enable file encryption.
 		Encryption bool `json:"encryption,omitempty"`
+
+		// ModelScopeRepoType is the ModelScope repository kind, "models" or "datasets".
+		ModelScopeRepoType string `json:"modelscope_repo_type,omitempty"`
+		// ModelScopeRevision is the ModelScope repository revision to commit to.
+		ModelScopeRevision string `json:"modelscope_revision,omitempty"`
+		// ModelScopeNamespace is the two-digit directory prefix of the physical
+		// object path inside the repository.
+		ModelScopeNamespace string `json:"modelscope_namespace,omitempty"`
 	}
 
 	FileType         int
@@ -309,6 +317,10 @@ const (
 	PolicyTypeOd     = "onedrive"
 	PolicyTypeRemote = "remote"
 	PolicyTypeObs    = "obs"
+
+	// PolicyTypeModelScope stores only file content in a content-addressed
+	// ModelScope repository; the file tree and metadata stay in Cloudreve's DB.
+	PolicyTypeModelScope = "modelscope"
 )
 
 const (

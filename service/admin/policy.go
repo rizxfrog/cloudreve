@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -261,6 +262,10 @@ func (service *CreateStoragePolicyService) Create(c *gin.Context) (*GetStoragePo
 	dep := dependency.FromContext(c)
 	storagePolicyClient := dep.StoragePolicyClient()
 
+	if err := normalizePolicy(service.Policy); err != nil {
+		return nil, err
+	}
+
 	if service.Policy.Type == types.PolicyTypeLocal {
 		service.Policy.DirNameRule = util.DataPath("uploads/{uid}/{path}")
 	}
@@ -272,6 +277,60 @@ func (service *CreateStoragePolicyService) Create(c *gin.Context) (*GetStoragePo
 	}
 
 	return &GetStoragePolicyResponse{StoragePolicy: policy}, nil
+}
+
+// modelScopeNamespaceRegexp matches the two-digit physical path namespace.
+var modelScopeNamespaceRegexp = regexp.MustCompile(`^[0-9]{2}$`)
+
+// normalizePolicy applies per-type invariants that the storage backend relies on
+// and validates type specific settings before the policy is persisted.
+func normalizePolicy(policy *ent.StoragePolicy) error {
+	if policy.Type != types.PolicyTypeModelScope {
+		return nil
+	}
+
+	if policy.Settings == nil {
+		policy.Settings = &types.PolicySetting{}
+	}
+
+	// Objects are addressed by the hash of their content, which is only known after the
+	// whole file has been read, so uploads must relay through this server.
+	policy.Settings.Relay = true
+
+	// The endpoint and repository id are required to locate the repository.
+	if policy.Server == "" {
+		policy.Server = "https://www.modelscope.cn"
+	}
+
+	if policy.BucketName == "" {
+		return serializer.NewError(serializer.CodeParamErr, "ModelScope repository id is required", nil)
+	}
+
+	if policy.SecretKey == "" {
+		return serializer.NewError(serializer.CodeParamErr, "ModelScope access token is required", nil)
+	}
+
+	if policy.Settings.ModelScopeRepoType == "" {
+		policy.Settings.ModelScopeRepoType = "datasets"
+	}
+
+	if policy.Settings.ModelScopeRepoType != "models" && policy.Settings.ModelScopeRepoType != "datasets" {
+		return serializer.NewError(serializer.CodeParamErr, "ModelScope repository type must be models or datasets", nil)
+	}
+
+	if policy.Settings.ModelScopeRevision == "" {
+		policy.Settings.ModelScopeRevision = "master"
+	}
+
+	if policy.Settings.ModelScopeNamespace == "" {
+		policy.Settings.ModelScopeNamespace = "00"
+	}
+
+	if !modelScopeNamespaceRegexp.MatchString(policy.Settings.ModelScopeNamespace) {
+		return serializer.NewError(serializer.CodeParamErr, "ModelScope namespace must be exactly two digits", nil)
+	}
+
+	return nil
 }
 
 type (
@@ -295,6 +354,10 @@ func (service *UpdateStoragePolicyService) Update(c *gin.Context) (*GetStoragePo
 	}
 
 	service.Policy.ID = idInt
+
+	if err := normalizePolicy(service.Policy); err != nil {
+		return nil, err
+	}
 
 	sc, tx, ctx, err := inventory.WithTx(c, storagePolicyClient)
 	if err != nil {

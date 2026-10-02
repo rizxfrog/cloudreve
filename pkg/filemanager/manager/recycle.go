@@ -15,6 +15,7 @@ import (
 	"github.com/cloudreve/Cloudreve/v4/inventory/types"
 	"github.com/cloudreve/Cloudreve/v4/pkg/cache"
 	"github.com/cloudreve/Cloudreve/v4/pkg/crontab"
+	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/driver"
 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/fs"
 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/fs/dbfs"
 	"github.com/cloudreve/Cloudreve/v4/pkg/logging"
@@ -226,6 +227,29 @@ func (m *manager) RecycleEntities(ctx context.Context, force bool, entityIDs ...
 			}), func(entity fs.Entity, index int) string {
 				return entity.Source()
 			})
+
+			// Content addressed handlers may share one physical object between several
+			// entities, so a source still referenced by another live entity must be kept.
+			if len(toBeDeletedSrc) > 0 &&
+				d.Capabilities().StaticFeatures.Enabled(int(driver.HandlerCapabilityContentAddressed)) {
+				excludeIDs := lo.Map(chunk, func(entity fs.Entity, index int) int {
+					return entity.ID()
+				})
+
+				referenced, err := m.dep.FileClient().ReferencedSources(ctx, toBeDeletedSrc, excludeIDs)
+				if err != nil {
+					for _, entity := range chunk {
+						ae.Add(strconv.Itoa(entity.ID()), err)
+					}
+					continue
+				}
+
+				toBeDeletedSrc = lo.Filter(toBeDeletedSrc, func(src string, index int) bool {
+					_, shared := referenced[src]
+					return !shared
+				})
+			}
+
 			if len(toBeDeletedSrc) > 0 {
 				res, err := d.Delete(ctx, toBeDeletedSrc...)
 				if err != nil {

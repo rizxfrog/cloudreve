@@ -180,6 +180,14 @@ func (f *fileClient) batchInConditionEntityID(pageSize, margin int, multiply int
 	}), chunks
 }
 
+func (f *fileClient) batchInConditionEntitySource(pageSize, margin int, multiply int, keys []string) ([]predicate.Entity, [][]string) {
+	pageSize = capPageSize(f.maxSQlParam, pageSize, margin)
+	chunks := lo.Chunk(keys, max(pageSize/multiply, 1))
+	return lo.Map(chunks, func(item []string, index int) predicate.Entity {
+		return entity.SourceIn(item...)
+	}), chunks
+}
+
 // cursorPagination perform pagination with cursor, which is faster than fast pagination, but less flexible.
 func (f *fileClient) cursorPagination(ctx context.Context, query *ent.FileQuery,
 	args *ListFileParameters, paramMargin int) ([]*ent.File, *PaginationResults, error) {

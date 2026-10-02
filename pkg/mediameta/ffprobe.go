@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"strconv"
 	"time"
@@ -102,6 +104,25 @@ func (f *ffprobeExtractor) Extract(ctx context.Context, ext string, source entit
 	var input string
 	if source.IsLocal() && !source.Entity().Encrypted() {
 		input = source.LocalPath(ctx)
+	} else if !source.CanGeneratePublicUrl() {
+		// A handler that only serves content through this server has no URL a
+		// sidecar process could fetch, so the bytes are relayed to a temp file.
+		tempFd, err := os.CreateTemp("", "cloudreve-ffprobe-*")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temp input file: %w", err)
+		}
+		defer func() {
+			_ = tempFd.Close()
+			_ = os.Remove(tempFd.Name())
+		}()
+
+		if _, err := io.Copy(tempFd, source); err != nil {
+			return nil, fmt.Errorf("failed to relay entity content: %w", err)
+		}
+		if err := tempFd.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close temp input file: %w", err)
+		}
+		input = tempFd.Name()
 	} else {
 		expire := time.Now().Add(UrlExpire)
 		srcUrl, err := source.Url(driver.WithForcePublicEndpoint(ctx, false), entitysource.WithNoInternalProxy(), entitysource.WithExpire(&expire))

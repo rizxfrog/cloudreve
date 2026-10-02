@@ -130,7 +130,9 @@ func (m *manager) CreateUploadSession(ctx context.Context, req *fs.UploadRequest
 	uploadSession.ChunkSize = uploadSession.Policy.Settings.ChunkSize
 	// Create upload credential for underlying storage driver
 	credential := &fs.UploadCredential{}
-	unrelayed := !uploadSession.Policy.Settings.Relay || m.stateless
+	// A handler may mandate relayed uploads regardless of the policy setting,
+	// because it cannot name an upload target before the content is read.
+	unrelayed := !(uploadSession.Policy.Settings.Relay || driver.UploadProxyRequired(d)) || m.stateless
 	if unrelayed {
 		credential, err = d.Token(ctx, uploadSession, req)
 		if err != nil {
@@ -251,7 +253,18 @@ func (m *manager) Upload(ctx context.Context, req *fs.UploadRequest, policy *ent
 	}
 
 	if err := d.Put(ctx, req); err != nil {
-		return serializer.NewError(serializer.CodeIOFailed, "Failed to upload file", err)
+		// Include the driver's reason: the generic message alone leaves an
+		// operator with no way to tell a rejected credential from a full or
+		// missing repository.
+		return serializer.NewError(serializer.CodeIOFailed, fmt.Sprintf("Failed to upload file: %s", err), err)
+	}
+
+	// Handlers with deferred source resolution only learn the physical path of an
+	// object once its content has been read, and write it back into the request.
+	// The session is what completion persists onto the entity.
+	if session != nil && req.Props != nil &&
+		d.Capabilities().StaticFeatures.Enabled(int(driver.HandlerCapabilitySourceDeferred)) {
+		session.Props.SavePath = req.Props.SavePath
 	}
 
 	return nil

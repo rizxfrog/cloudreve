@@ -177,8 +177,10 @@ type FileClient interface {
 	SetParent(ctx context.Context, files []*ent.File, parent *ent.File) error
 	// CreateFile creates a file with given parameters, returns created File, default Entity, and storage diff for owner.
 	CreateFile(ctx context.Context, root *ent.File, args *CreateFileParameters) (*ent.File, *ent.Entity, StorageDiff, error)
-	// UpgradePlaceholder upgrades a placeholder entity to a real version entity
-	UpgradePlaceholder(ctx context.Context, file *ent.File, modifiedAt *time.Time, entityId int, entityType types.EntityType) error
+	// UpgradePlaceholder upgrades a placeholder entity to a real version entity. When source
+	// is non-empty it replaces the entity's physical source, which deferred-source handlers
+	// resolve only after the content has been read.
+	UpgradePlaceholder(ctx context.Context, file *ent.File, modifiedAt *time.Time, entityId int, entityType types.EntityType, source string) error
 	// RemoveMetadata removes metadata from a file
 	RemoveMetadata(ctx context.Context, file *ent.File, keys ...string) error
 	// CreateEntity creates an entity with given parameters, returns created Entity, and storage diff for owner.
@@ -222,6 +224,10 @@ type FileClient interface {
 	CountEntityByStoragePolicyID(ctx context.Context, storagePolicyID int) (int, int, error)
 	// IsStoragePolicyUsedByEntities checks if a storage policy is used by entities
 	IsStoragePolicyUsedByEntities(ctx context.Context, policyID int) (bool, error)
+	// ReferencedSources returns the subset of the given physical sources that are still
+	// referenced by an entity other than the ones in excludeIDs. It is used by content
+	// addressed policies, where several entities can share one physical object.
+	ReferencedSources(ctx context.Context, sources []string, excludeIDs []int) (map[string]struct{}, error)
 	// DeleteByUser deletes all files by a given user
 	DeleteByUser(ctx context.Context, uid int) error
 	// FlattenListFiles list files ignoring hierarchy
@@ -751,7 +757,7 @@ func (f *fileClient) RemoveMetadata(ctx context.Context, file *ent.File, keys ..
 }
 
 func (f *fileClient) UpgradePlaceholder(ctx context.Context, file *ent.File, modifiedAt *time.Time, entityId int,
-	entityType types.EntityType) error {
+	entityType types.EntityType, source string) error {
 	entities, err := file.Edges.EntitiesOrErr()
 	if err != nil {
 		return err
@@ -769,6 +775,12 @@ func (f *fileClient) UpgradePlaceholder(ctx context.Context, file *ent.File, mod
 		ClearUploadSessionID()
 	if modifiedAt != nil {
 		stm.SetUpdatedAt(*modifiedAt)
+	}
+
+	// The physical source is only known after the content was read for handlers
+	// with deferred source resolution.
+	if source != "" {
+		stm.SetSource(source)
 	}
 
 	if err := stm.Exec(ctx); err != nil {
@@ -901,6 +913,40 @@ func (f *fileClient) IsStoragePolicyUsedByEntities(ctx context.Context, policyID
 	}
 
 	return false, nil
+}
+
+func (f *fileClient) ReferencedSources(ctx context.Context, sources []string, excludeIDs []int) (map[string]struct{}, error) {
+	referenced := make(map[string]struct{})
+	if len(sources) == 0 {
+		return referenced, nil
+	}
+
+	// Only entities that still hold a reference keep the object alive; a stale
+	// entity in the same recycle batch is excluded by ID.
+	exclude := make([]int, 0, len(excludeIDs))
+	exclude = append(exclude, excludeIDs...)
+
+	groups, _ := f.batchInConditionEntitySource(intsets.MaxInt, 10, 1, sources)
+	for _, group := range groups {
+		query := f.client.Entity.Query().
+			Where(group).
+			Where(entity.ReferenceCountGT(0))
+
+		if len(exclude) > 0 {
+			query = query.Where(entity.IDNotIn(exclude...))
+		}
+
+		res, err := query.Select(entity.FieldSource).All(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query referenced sources: %v", err)
+		}
+
+		for _, e := range res {
+			referenced[e.Source] = struct{}{}
+		}
+	}
+
+	return referenced, nil
 }
 
 func (f *fileClient) RemoveStaleEntities(ctx context.Context, file *ent.File) (StorageDiff, error) {

@@ -35,8 +35,12 @@ var (
 
 func init() {
 	boolset.Sets(map[driver.HandlerCapability]bool{
-		driver.HandlerCapabilityProxyRequired: true,
-		driver.HandlerCapabilityInboundGet:    true,
+		// Content lives in this machine's filesystem, so a client cannot fetch
+		// it directly and every download is served by this server. Uploads are
+		// unaffected: the handler does receive the bytes itself, and its
+		// credential call is what provisions the placeholder file.
+		driver.HandlerCapabilityDownloadProxyRequired: true,
+		driver.HandlerCapabilityInboundGet:            true,
 	}, capabilities.StaticFeatures)
 }
 
@@ -229,9 +233,9 @@ func (handler *Driver) Token(ctx context.Context, uploadSession *fs.UploadSessio
 	} else {
 		// When disk pre-allocation is disabled, concurrent chunk uploads must be 1
 		// to avoid disk fragmentation and write contention on local storage.
- 		settings := *handler.Policy.Settings
- 		settings.ChunkConcurrency = 1
- 		handler.Policy.Settings = &settings
+		settings := *handler.Policy.Settings
+		settings.ChunkConcurrency = 1
+		handler.Policy.Settings = &settings
 	}
 
 	return &fs.UploadCredential{

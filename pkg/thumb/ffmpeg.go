@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -29,6 +31,44 @@ type FfmpegGenerator struct {
 	settings setting.Provider
 }
 
+// relayToTempFile streams the entity into a temporary file in dir so an
+// external tool can consume it as a local path. It is used for policies whose
+// content is only reachable through this server and therefore has no URL a
+// sidecar process could fetch. The file keeps the original extension so the
+// tool can detect the container format. The returned cleanup removes it.
+func relayToTempFile(ctx context.Context, es entitysource.EntitySource, dir, ext string) (string, func(), error) {
+	if err := util.CreatNestedFolder(filepath.Dir(dir)); err != nil {
+		return "", nil, fmt.Errorf("failed to create temp folder: %w", err)
+	}
+
+	pattern := "*"
+	if ext != "" {
+		pattern = "*." + strings.TrimPrefix(ext, ".")
+	}
+
+	tempFd, err := os.CreateTemp(filepath.Dir(dir), pattern)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create temp input file: %w", err)
+	}
+
+	cleanup := func() {
+		_ = tempFd.Close()
+		_ = os.Remove(tempFd.Name())
+	}
+
+	if _, err := io.Copy(tempFd, es); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("failed to relay entity content: %w", err)
+	}
+
+	if err := tempFd.Close(); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("failed to close temp input file: %w", err)
+	}
+
+	return tempFd.Name(), func() { _ = os.Remove(tempFd.Name()) }, nil
+}
+
 func (f *FfmpegGenerator) Generate(ctx context.Context, es entitysource.EntitySource, ext string, previous *Result) (*Result, error) {
 	if !util.IsInExtensionListExt(f.settings.FFMpegThumbExts(ctx), ext) {
 		return nil, fmt.Errorf("unsupported video format: %w", ErrPassThrough)
@@ -52,6 +92,16 @@ func (f *FfmpegGenerator) Generate(ctx context.Context, es entitysource.EntitySo
 	expire := time.Now().Add(urlTimeout)
 	if es.IsLocal() && !es.Entity().Encrypted() {
 		input = es.LocalPath(ctx)
+	} else if !es.CanGeneratePublicUrl() {
+		// A handler that only serves content through this server (for example a
+		// policy whose objects cannot be fetched with a signed URL) must be read
+		// through the relayed source instead of a URL.
+		tempPath, cleanup, err := relayToTempFile(ctx, es, tempOutputPath, ext)
+		if err != nil {
+			return nil, err
+		}
+		defer cleanup()
+		input = tempPath
 	} else {
 		opts := []entitysource.EntitySourceOption{
 			entitysource.WithContext(ctx),

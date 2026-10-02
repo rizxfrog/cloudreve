@@ -323,7 +323,7 @@ func (f *DBFS) CompleteUpload(ctx context.Context, session *fs.UploadSession) (f
 		return nil, serializer.NewError(serializer.CodeDBError, "Failed to start transaction", err)
 	}
 
-	err = fc.UpgradePlaceholder(ctx, filePrivate.Model, session.Props.LastModified, session.EntityID, entityType)
+	err = fc.UpgradePlaceholder(ctx, filePrivate.Model, session.Props.LastModified, session.EntityID, entityType, session.Props.SavePath)
 	if err != nil {
 		_ = inventory.Rollback(tx)
 		return nil, serializer.NewError(serializer.CodeDBError, "Failed to update placeholder file", err)

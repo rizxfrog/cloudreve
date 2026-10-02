@@ -69,6 +69,9 @@ type EntitySource interface {
 	CloneToLocalSrc(t types.EntityType, src string) (EntitySource, error)
 	// ShouldInternalProxy returns true if the source will/should be proxied by internal proxy.
 	ShouldInternalProxy(opts ...EntitySourceOption) bool
+	// CanGeneratePublicUrl reports whether a browser fetchable URL can be generated for
+	// this entity. Handlers that must relay content through this server answer false.
+	CanGeneratePublicUrl() bool
 }
 
 type EntitySourceOption interface {
@@ -311,8 +314,10 @@ func (f *entitySource) Serve(w http.ResponseWriter, r *http.Request, opts ...Ent
 		return
 	}
 
-	if !f.IsLocal() {
-		// for non-local file, reverse-proxy the request
+	if !f.IsLocal() && f.hasPublicSource() {
+		// for non-local file, reverse-proxy the request. An object with no URL a
+		// client could fetch must not generate one: the same route serves this
+		// request, so proxying to it would resolve back to this handler in a loop.
 		expire := time.Now().Add(defaultUrlExpire)
 		u, err := f.Url(driver.WithForcePublicEndpoint(f.o.Ctx, false), WithNoInternalProxy(), WithExpire(&expire))
 		if err != nil {
@@ -579,9 +584,61 @@ func (f *entitySource) ShouldInternalProxy(opts ...EntitySourceOption) bool {
 	for _, opt := range opts {
 		opt.Apply(f.o)
 	}
-	handlerCapability := f.handler.Capabilities()
-	return f.e.ID() == 0 || handlerCapability.StaticFeatures.Enabled(int(driver.HandlerCapabilityProxyRequired)) ||
+	return f.e.ID() == 0 || driver.DownloadProxyRequired(f.handler) ||
 		(f.policy.Settings.InternalProxy || f.e.Encrypted()) && !f.o.NoInternalProxy
+}
+
+// hasPublicSource reports whether a URL a client can fetch without this server
+// exists for this object. A handler that resolves content itself, or that keeps
+// some objects inline, has none and must be served through this server.
+func (f *entitySource) hasPublicSource() bool {
+	if resolver, ok := f.handler.(driver.SourceResolver); ok {
+		return resolver.HasPublicSource(f.e)
+	}
+	// A handler that only ever serves content through this server never has one.
+	if _, ok := f.handler.(driver.Streamer); ok {
+		return false
+	}
+	return true
+}
+
+// CanGeneratePublicUrl reports whether a URL a client can fetch without this
+// server exists for the entity. It is false for handlers that resolve content
+// themselves, such as content addressed stores that must relay the bytes.
+func (f *entitySource) CanGeneratePublicUrl() bool {
+	return f.hasPublicSource()
+}
+
+// internalProxyUrl builds the signed route that serves this entity through this
+// server. It is the fallback for every object without a directly fetchable URL.
+func (f *entitySource) internalProxyUrl(ctx context.Context, displayName string, expire *time.Time) (*EntityUrl, error) {
+	siteUrl := f.settings.SiteURL(ctx)
+	base := routes.MasterFileContentUrl(
+		siteUrl,
+		hashid.EncodeEntityID(f.hasher, f.e.ID()),
+		displayName,
+		f.o.IsDownload,
+		f.o.IsThumb,
+		f.o.SpeedLimit,
+	)
+
+	srcUrl, err := auth.SignURI(ctx, f.generalAuth, base.String(), expire)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign internal proxy URL: %w", err)
+	}
+
+	if f.IsLocal() {
+		// For local file, we need to apply proxy if needed
+		srcUrl, err = driver.ApplyProxyIfNeeded(f.policy, srcUrl)
+		if err != nil {
+			return nil, fmt.Errorf("failed to apply proxy: %w", err)
+		}
+	}
+
+	return &EntityUrl{
+		Url:      srcUrl.String(),
+		ExpireAt: expire,
+	}, nil
 }
 
 func (f *entitySource) Url(ctx context.Context, opts ...EntitySourceOption) (*EntityUrl, error) {
@@ -610,55 +667,40 @@ func (f *entitySource) Url(ctx context.Context, opts ...EntitySourceOption) (*En
 	// 2. Internal proxy is enabled in Policy setting and not disabled by option
 	// 3. It's an empty entity.
 	// 4. The entity is encrypted and internal proxy not disabled by option
+	// 5. The object has no URL a client could fetch itself.
 	handlerCapability := f.handler.Capabilities()
-	if f.ShouldInternalProxy() {
-		siteUrl := f.settings.SiteURL(ctx)
-		base := routes.MasterFileContentUrl(
-			siteUrl,
-			hashid.EncodeEntityID(f.hasher, f.e.ID()),
-			displayName,
-			f.o.IsDownload,
-			f.o.IsThumb,
-			f.o.SpeedLimit,
-		)
+	if f.ShouldInternalProxy() || !f.hasPublicSource() {
+		return f.internalProxyUrl(ctx, displayName, expire)
+	}
 
-		srcUrl, err = auth.SignURI(ctx, f.generalAuth, base.String(), expire)
-		if err != nil {
-			return nil, fmt.Errorf("failed to sign internal proxy URL: %w", err)
-		}
-
-		if f.IsLocal() {
-			// For local file, we need to apply proxy if needed
-			srcUrl, err = driver.ApplyProxyIfNeeded(f.policy, srcUrl)
-			if err != nil {
-				return nil, fmt.Errorf("failed to apply proxy: %w", err)
-			}
-		}
+	expire = capExpireTime(expire, handlerCapability.MinSourceExpire, handlerCapability.MaxSourceExpire)
+	if f.o.IsThumb {
+		srcUrlStr, err = f.handler.Thumb(ctx, expire, util.Ext(f.o.DisplayName), f.e)
 	} else {
-		expire = capExpireTime(expire, handlerCapability.MinSourceExpire, handlerCapability.MaxSourceExpire)
-		if f.o.IsThumb {
-			srcUrlStr, err = f.handler.Thumb(ctx, expire, util.Ext(f.o.DisplayName), f.e)
-		} else {
-			srcUrlStr, err = f.handler.Source(ctx, f.e, &driver.GetSourceArgs{
-				Expire:      expire,
-				IsDownload:  f.o.IsDownload,
-				Speed:       f.o.SpeedLimit,
-				DisplayName: displayName,
-			})
+		srcUrlStr, err = f.handler.Source(ctx, f.e, &driver.GetSourceArgs{
+			Expire:      expire,
+			IsDownload:  f.o.IsDownload,
+			Speed:       f.o.SpeedLimit,
+			DisplayName: displayName,
+		})
+	}
+	if err != nil {
+		// A handler that keeps some objects inline has no URL for those, so fall
+		// back to the relay rather than failing an otherwise readable object.
+		if errors.Is(err, driver.ErrNoPublicUrl) {
+			return f.internalProxyUrl(ctx, displayName, expire)
 		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to get source URL: %w", err)
-		}
+		return nil, fmt.Errorf("failed to get source URL: %w", err)
+	}
 
-		srcUrl, err = url.Parse(srcUrlStr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse origin URL: %w", err)
-		}
+	srcUrl, err = url.Parse(srcUrlStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse origin URL: %w", err)
+	}
 
-		srcUrl, err = driver.ApplyProxyIfNeeded(f.policy, srcUrl)
-		if err != nil {
-			return nil, fmt.Errorf("failed to apply proxy: %w", err)
-		}
+	srcUrl, err = driver.ApplyProxyIfNeeded(f.policy, srcUrl)
+	if err != nil {
+		return nil, fmt.Errorf("failed to apply proxy: %w", err)
 	}
 
 	return &EntityUrl{
@@ -682,6 +724,13 @@ func (f *entitySource) resetRequest() error {
 }
 
 func (f *entitySource) getRsc(pos int64) (io.ReadCloser, error) {
+	if f.rsc != nil {
+		// Re-reading the same position must not discard the pending stream: a
+		// cancelled request cancels its context, and rebuilding from it would
+		// issue a read that is already dead.
+		return f.rsc, nil
+	}
+
 	// For inbound files, we can use the handler to open the file directly
 	var rsc io.ReadCloser
 	if f.IsLocal() {
@@ -702,6 +751,20 @@ func (f *entitySource) getRsc(pos int64) (io.ReadCloser, error) {
 			rsc = lrs{file, ratelimit.Reader(file, bucket)}
 		} else {
 			rsc = file
+		}
+	} else if streamer, ok := f.handler.(driver.Streamer); ok {
+		// A handler that can serve content through this server owns the whole read
+		// path; generating a URL would fail for objects without a fetchable one.
+		stream, err := streamer.OpenStream(f.o.Ctx, f.e, pos)
+		if err != nil {
+			return nil, err
+		}
+
+		if f.o.SpeedLimit > 0 {
+			bucket := ratelimit.NewBucketWithRate(float64(f.o.SpeedLimit), f.o.SpeedLimit)
+			rsc = lrs{stream, ratelimit.Reader(stream, bucket)}
+		} else {
+			rsc = stream
 		}
 	} else {
 		var urlStr string
