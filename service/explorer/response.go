@@ -15,6 +15,7 @@ import (
 	"github.com/cloudreve/Cloudreve/v4/pkg/auth"
 	"github.com/cloudreve/Cloudreve/v4/pkg/boolset"
 	"github.com/cloudreve/Cloudreve/v4/pkg/cluster/routes"
+	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/driver/modelscope"
 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/fs"
 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/manager"
 	"github.com/cloudreve/Cloudreve/v4/pkg/hashid"
@@ -320,6 +321,11 @@ type Entity struct {
 	StoragePolicy *StoragePolicy   `json:"storage_policy,omitempty"`
 	CreatedBy     *user.User       `json:"created_by,omitempty"`
 	EncryptedWith types.Cipher     `json:"encrypted_with,omitempty"`
+	// Sha256 is the content digest of the stored object. Only policies that
+	// address objects by their content can report it, because for those the
+	// stored path is derived from the digest; policies that name objects
+	// independently of their content have nothing to recover.
+	Sha256 string `json:"sha256,omitempty"`
 }
 
 type Share struct {
@@ -491,14 +497,25 @@ func BuildEntity(ctx context.Context, extendedInfo *fs.FileExtendedInfo, e fs.En
 		encryptedWith = e.Props().EncryptMetadata.Algorithm
 	}
 
+	policy := extendedInfo.EntityStoragePolicies[e.PolicyID()]
+
+	// A content-addressed policy stores the object under its SHA-256, so the
+	// digest is recoverable from the stored path. Other policies name objects
+	// independently of their content and have no digest to report.
+	digest := ""
+	if policy != nil && types.PolicyType(policy.Type) == types.PolicyTypeModelScope {
+		digest = modelscope.HashFromObjectPath(e.Source())
+	}
+
 	return Entity{
 		ID:            hashid.EncodeEntityID(hasher, e.ID()),
 		Type:          e.Type(),
 		CreatedAt:     e.CreatedAt(),
-		StoragePolicy: BuildStoragePolicy(extendedInfo.EntityStoragePolicies[e.PolicyID()], hasher),
+		StoragePolicy: BuildStoragePolicy(policy, hasher),
 		Size:          e.Size(),
 		CreatedBy:     u,
 		EncryptedWith: encryptedWith,
+		Sha256:        digest,
 	}
 }
 
