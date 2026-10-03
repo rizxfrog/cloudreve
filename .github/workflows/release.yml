@@ -1,0 +1,124 @@
+name: Release
+
+# Tag pushes run a full release build. The manual trigger rebuilds an already
+# existing tag without pushing a new one.
+on:
+  push:
+    tags:
+      - "v*"
+      - "4.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release"
+        required: true
+      frontend_repo:
+        description: "Frontend repository (owner/name)"
+        default: "cloudreve/frontend"
+        required: false
+      frontend_ref:
+        description: "Frontend git ref (branch, tag or SHA)"
+        default: "master"
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: "1.26.5"
+  NODE_VERSION: "22"
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve build parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            {
+              echo "tag=${{ inputs.tag }}"
+              echo "frontend_repo=${{ inputs.frontend_repo }}"
+              echo "frontend_ref=${{ inputs.frontend_ref }}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "tag=${GITHUB_REF_NAME}"
+              echo "frontend_repo=cloudreve/frontend"
+              echo "frontend_ref=master"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout backend
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.params.outputs.tag }}
+          fetch-depth: 0
+
+      # The frontend is a separate repository. It is checked out into ./frontend
+      # because .build/build-assets.sh reads it from there and packs the built
+      # assets into application/statics/assets.zip for the go:embed directive.
+      # For a private frontend repo set the FRONTEND_TOKEN secret to a token
+      # that can read it.
+      - name: Checkout frontend
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.params.outputs.frontend_repo }}
+          ref: ${{ steps.params.outputs.frontend_ref }}
+          path: frontend
+          token: ${{ secrets.FRONTEND_TOKEN || github.token }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The linux/arm64 image is cross-built on the amd64 runner, so binfmt/QEMU
+      # must be registered before GoReleaser builds it.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Builds every platform binary plus checksums, and loads the linux/amd64
+      # and linux/arm64 Docker images into the local daemon (skip_push in
+      # .goreleaser.yaml keeps them from being pushed to a registry).
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean --skip=validate --timeout 60m -p 4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Export Docker images as tarballs
+        env:
+          TAG: ${{ steps.params.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-docker
+          for arch in amd64 arm64; do
+            image="cloudreve/cloudreve:${TAG}-${arch}"
+            docker image inspect "${image}" >/dev/null
+            docker save "${image}" | gzip -9 > "release-docker/cloudreve_${TAG}_docker_linux_${arch}.tar.gz"
+          done
+          ls -lh release-docker
+
+      - name: Attach Docker tarballs to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.params.outputs.tag }}
+        run: gh release upload "${TAG}" release-docker/*.tar.gz --clobber

@@ -85,6 +85,9 @@ dockers:
     goos: linux
     goarch: amd64
     goamd64: v1
+    # CI only needs the built image in the local daemon so it can be exported
+    # as a tarball into the release; it is not pushed to a registry.
+    skip_push: true
     extra_files:
       - .build/aria2.supervisor.conf
       - .build/entrypoint.sh
@@ -97,6 +100,7 @@ dockers:
       - "--provenance=false"
     goos: linux
     goarch: arm64
+    skip_push: true
     extra_files:
       - .build/aria2.supervisor.conf
       - .build/entrypoint.sh
@@ -104,15 +108,21 @@ dockers:
       - "cloudreve/cloudreve:{{ .Tag }}-arm64"
 
 docker_manifests:
+  # Images are shipped as release tarballs instead of being pushed, so there is
+  # no registry manifest to assemble; skip it (otherwise the create step fails
+  # because the local-only images are absent from any registry).
   - name_template: "cloudreve/cloudreve:latest"
+    skip_push: true
     image_templates:
       - "cloudreve/cloudreve:{{ .Tag }}-amd64"
       - "cloudreve/cloudreve:{{ .Tag }}-arm64"
   - name_template: "cloudreve/cloudreve:v4"
+    skip_push: true
     image_templates:
       - "cloudreve/cloudreve:{{ .Tag }}-amd64"
       - "cloudreve/cloudreve:{{ .Tag }}-arm64"
   - name_template: "cloudreve/cloudreve:{{ .Tag }}"
+    skip_push: true
     image_templates:
       - "cloudreve/cloudreve:{{ .Tag }}-amd64"
       - "cloudreve/cloudreve:{{ .Tag }}-arm64"
