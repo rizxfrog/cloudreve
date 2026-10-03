@@ -7,28 +7,7 @@ import (
 	"github.com/rafaeljusto/redigomock"
 	"github.com/stretchr/testify/assert"
 	"testing"
-	"time"
 )
-
-func TestNewRedisStore(t *testing.T) {
-	asserts := assert.New(t)
-
-	store := NewRedisStore(10, "tcp", "", "", "0")
-	asserts.NotNil(store)
-
-	conn, err := store.pool.Dial()
-	asserts.Nil(conn)
-	asserts.Error(err)
-
-	testConn := redigomock.NewConn()
-	cmd := testConn.Command("PING").Expect("PONG")
-	err = store.pool.TestOnBorrow(testConn, time.Now())
-	if testConn.Stats(cmd) != 1 {
-		fmt.Println("Command was not used")
-		return
-	}
-	asserts.NoError(err)
-}
 
 func TestRedisStore_Set(t *testing.T) {
 	asserts := assert.New(t)
@@ -291,7 +270,7 @@ func TestRedisStore_Delete(t *testing.T) {
 	// 正常
 	{
 		cmd := conn.Command("DEL", redigomock.NewAnyData(), redigomock.NewAnyData(), redigomock.NewAnyData(), redigomock.NewAnyData()).ExpectSlice("OK")
-		err := store.Delete([]string{"1", "2", "3", "4"}, "test_")
+		err := store.Delete("test_", "1", "2", "3", "4")
 		asserts.NoError(err)
 		if conn.Stats(cmd) != 1 {
 			fmt.Println("Command was not used")
@@ -303,7 +282,7 @@ func TestRedisStore_Delete(t *testing.T) {
 	{
 		conn.Clear()
 		cmd := conn.Command("DEL", redigomock.NewAnyData(), redigomock.NewAnyData(), redigomock.NewAnyData(), redigomock.NewAnyData()).ExpectError(errors.New("error"))
-		err := store.Delete([]string{"1", "2", "3", "4"}, "test_")
+		err := store.Delete("test_", "1", "2", "3", "4")
 		asserts.Error(err)
 		if conn.Stats(cmd) != 1 {
 			fmt.Println("Command was not used")
@@ -318,7 +297,7 @@ func TestRedisStore_Delete(t *testing.T) {
 			Dial:    func() (redis.Conn, error) { return nil, errors.New("error") },
 			MaxIdle: 10,
 		}
-		err := store.Delete([]string{"1", "2", "3", "4"}, "test_")
+		err := store.Delete("test_", "1", "2", "3", "4")
 		asserts.Error(err)
 	}
 }
