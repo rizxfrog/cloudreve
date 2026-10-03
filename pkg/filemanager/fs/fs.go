@@ -257,6 +257,11 @@ type (
 		MimeType        string                 `json:"mime_type,omitempty"`     // Expected mimetype
 		UploadPolicy    string                 `json:"upload_policy,omitempty"` // Upyun upload policy
 		EncryptMetadata *types.EncryptMetadata `json:"encrypt_metadata,omitempty"`
+		// Prevalidated reports that the store already holds the content this
+		// session describes, confirmed from the client supplied digest before any
+		// content was received. The client sends no content; the upload completes
+		// by referencing the object already present.
+		Prevalidated bool `json:"prevalidated,omitempty"`
 	}
 
 	// UploadSession stores the information of an upload session, used in server side.
@@ -278,6 +283,11 @@ type (
 
 		LockToken string // Token of the locked placeholder file
 		Props     *UploadProps
+		// Prevalidated reports that the content this session uploads already
+		// exists in the store, confirmed by the client supplied digest before any
+		// content was received. The client sends no content and completion writes
+		// the reference to the object already present.
+		Prevalidated bool
 		// ChunksReceived records the set of chunk indices that have been fully
 		// uploaded. Used to safely trigger CompleteUpload only after every
 		// chunk has been received when the client uploads chunks concurrently.

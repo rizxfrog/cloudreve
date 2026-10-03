@@ -164,6 +164,10 @@ type UploadSessionResponse struct {
 	MimeType        string                 `json:"mime_type,omitempty"`
 	UploadPolicy    string                 `json:"upload_policy,omitempty"`
 	EncryptMetadata *types.EncryptMetadata `json:"encrypt_metadata,omitempty"`
+	// Prevalidated reports that the store already holds the content this session
+	// describes, confirmed from the content hash before any content arrived. The
+	// client sends no content; completion records a reference to the object.
+	Prevalidated bool `json:"prevalidated,omitempty"`
 }
 
 func BuildUploadSessionResponse(session *fs.UploadCredential, hasher hashid.Encoder) *UploadSessionResponse {
@@ -181,6 +185,7 @@ func BuildUploadSessionResponse(session *fs.UploadCredential, hasher hashid.Enco
 		MimeType:        session.MimeType,
 		UploadPolicy:    session.UploadPolicy,
 		EncryptMetadata: session.EncryptMetadata,
+		Prevalidated:    session.Prevalidated,
 	}
 
 	if session.EncryptMetadata != nil {

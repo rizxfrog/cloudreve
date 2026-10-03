@@ -133,12 +133,26 @@ func (m *manager) CreateUploadSession(ctx context.Context, req *fs.UploadRequest
 	// A handler may mandate relayed uploads regardless of the policy setting,
 	// because it cannot name an upload target before the content is read.
 	unrelayed := !(uploadSession.Policy.Settings.Relay || driver.UploadProxyRequired(d)) || m.stateless
+
+	// A content-addressed store can answer, from the digest alone, whether the
+	// content is already held. When it is, the client does not have to send bytes
+	// it has already produced a digest for: completion only records a reference
+	// to the object already present.
 	if unrelayed {
 		credential, err = d.Token(ctx, uploadSession, req)
 		if err != nil {
 			m.OnUploadFailed(ctx, uploadSession)
 			return nil, err
 		}
+	} else if prevalidated, probeErr := m.prevalidateDigest(ctx, d, req); probeErr != nil {
+		// A failed probe only costs the client a transfer it could have skipped,
+		// so it must never fail the upload itself.
+		m.l.Warning("Digest probe for %q failed, content will be received: %s", req.Props.ClientHash, probeErr)
+	} else if prevalidated {
+		uploadSession.Prevalidated = true
+		credential.ChunkSize = 0
+		credential.Prevalidated = true
+		uploadSession.ChunkSize = 0
 	} else {
 		// For relayed upload, we don't need to create credential
 		uploadSession.ChunkSize = 0
@@ -183,6 +197,27 @@ func (m *manager) CreateUploadSession(ctx context.Context, req *fs.UploadRequest
 	}
 
 	return credential, nil
+}
+
+// prevalidateDigest asks a content-addressed handler whether the object a client
+// describes by digest already exists, so the content need not be received at all.
+// It reports false for handlers that cannot answer, for an upload with no client
+// digest, and for a file that does not name objects by content.
+func (m *manager) prevalidateDigest(ctx context.Context, d driver.Handler, req *fs.UploadRequest) (bool, error) {
+	if req.Props == nil || req.Props.ClientHash == "" {
+		return false, nil
+	}
+
+	if !d.Capabilities().StaticFeatures.Enabled(int(driver.HandlerCapabilityDigestDedup)) {
+		return false, nil
+	}
+
+	resolver, ok := d.(driver.DigestResolver)
+	if !ok {
+		return false, nil
+	}
+
+	return resolver.ObjectExistsByDigest(ctx, req.Props.ClientHash, req.Props.Size)
 }
 
 func (m *manager) ConfirmUploadSession(ctx context.Context, session *fs.UploadSession, chunkIndex int) (fs.File, error) {
@@ -396,7 +431,13 @@ func (m *manager) CompleteUpload(ctx context.Context, session *fs.UploadSession)
 		return nil, err
 	}
 
-	if err := d.CompleteUpload(ctx, session); err != nil {
+	// A prevalidated session never received content: the store already holds the
+	// object, and completion only has to record a reference to it.
+	if session.Prevalidated {
+		if err := m.commitExistingObject(ctx, d, session); err != nil {
+			return nil, err
+		}
+	} else if err := d.CompleteUpload(ctx, session); err != nil {
 		return nil, err
 	}
 
@@ -426,6 +467,28 @@ func (m *manager) CompleteUpload(ctx context.Context, session *fs.UploadSession)
 	_ = m.kv.Delete(UploadSessionCachePrefix, session.Props.UploadSessionID)
 	releaseUploadSessionLock(session.Props.UploadSessionID)
 	return file, nil
+}
+
+// commitExistingObject records an upload as a reference to an object the store
+// already holds, without any content having been received. The path it resolves
+// is written onto the session so completion persists it onto the entity, exactly
+// as the content receiving paths do.
+func (m *manager) commitExistingObject(ctx context.Context, d driver.Handler, session *fs.UploadSession) error {
+	resolver, ok := d.(driver.DigestResolver)
+	if !ok {
+		return fmt.Errorf("storage policy cannot reference an object without its content")
+	}
+
+	req := &fs.UploadRequest{Props: session.Props.Copy()}
+	if err := resolver.CommitReference(ctx, req); err != nil {
+		return serializer.NewError(serializer.CodeIOFailed, fmt.Sprintf("Failed to reference stored object: %s", err), err)
+	}
+
+	if req.Props != nil {
+		session.Props.SavePath = req.Props.SavePath
+	}
+
+	return nil
 }
 
 func (m *manager) Update(ctx context.Context, req *fs.UploadRequest, opts ...fs.Option) (fs.File, error) {

@@ -163,6 +163,25 @@ func (service *UploadService) SlaveUpload(c *gin.Context) error {
 }
 
 func processChunkUpload(c *gin.Context, m manager.FileManager, session *fs.UploadSession, index int, file fs.File, mode fs.WriteMode) error {
+	ctx := context.WithValue(c, cluster.SlaveNodeIDCtx{}, strconv.Itoa(session.Policy.NodeID))
+
+	// A prevalidated session carries no content: the store already holds the
+	// object, confirmed from the client digest when the session was created.
+	// Nothing is read or written; the request only drives completion, which
+	// records a reference to the object already present.
+	if session.Prevalidated {
+		allReceived, err := m.MarkChunkUploaded(ctx, session, index)
+		if err != nil {
+			return err
+		}
+		if allReceived {
+			if _, err := m.CompleteUpload(ctx, session); err != nil {
+				return fmt.Errorf("failed to complete upload: %w", err)
+			}
+		}
+		return nil
+	}
+
 	// 取得并校验文件大小是否符合分片要求
 	chunkSize := session.ChunkSize
 	isLastChunk := session.ChunkSize == 0 || int64(index+1)*chunkSize >= session.Props.Size
@@ -193,7 +212,6 @@ func processChunkUpload(c *gin.Context, m manager.FileManager, session *fs.Uploa
 	}
 
 	// 执行上传
-	ctx := context.WithValue(c, cluster.SlaveNodeIDCtx{}, strconv.Itoa(session.Policy.NodeID))
 	err = m.Upload(ctx, req, session.Policy, session)
 	if err != nil {
 		return err

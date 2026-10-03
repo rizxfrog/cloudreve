@@ -44,7 +44,27 @@ const (
 	// handler cannot address an upload target before the content is read, so it must never be
 	// handed out a direct upload credential.
 	HandlerCapabilityUploadProxyRequired
+	// HandlerCapabilityDigestDedup this handler can answer, before any content arrives, whether
+	// the object addressed by a given content digest already exists. A handler that advertises
+	// it must implement DigestResolver. It lets a client that already produced a digest skip
+	// sending content this store already holds.
+	HandlerCapabilityDigestDedup
 )
+
+// DigestResolver is an optional interface for content-addressed handlers that can
+// look an object up by content digest before any content is received, and then
+// record a reference to it without receiving the content at all. It is only
+// consulted for an upload whose client supplied a digest.
+type DigestResolver interface {
+	// ObjectExistsByDigest reports whether the object described by digest and size
+	// is already stored, so the upload may skip receiving its content.
+	ObjectExistsByDigest(ctx context.Context, digest string, size int64) (bool, error)
+
+	// CommitReference records the upload as a reference to the object described by
+	// the request's client supplied digest, without receiving any content. It is
+	// called only after ObjectExistsByDigest confirmed the object is present.
+	CommitReference(ctx context.Context, file *fs.UploadRequest) error
+}
 
 // DownloadProxyRequired reports whether downloads must be relayed through this
 // server by definition, regardless of the policy's internal proxy setting.

@@ -49,6 +49,10 @@ func init() {
 		// The object path derives from the content digest, which is only known
 		// after the stream has been read.
 		driver.HandlerCapabilitySourceDeferred: true,
+		// An object addressed by a digest the repository or the upstream store
+		// already holds needs no content transfer, so a client that computed the
+		// digest can skip sending it.
+		driver.HandlerCapabilityDigestDedup: true,
 	}, features)
 }
 
@@ -448,6 +452,61 @@ func (d *Driver) Source(ctx context.Context, e fs.Entity, args *driver.GetSource
 // URL of their own, so they can only be read through this server.
 func (d *Driver) HasPublicSource(e fs.Entity) bool {
 	return e.Size() > inlineLimit
+}
+
+// ObjectExistsByDigest reports whether the object for digest is already stored,
+// so a client that computed the digest can skip sending content this store
+// already holds.
+//
+// It is deliberately not consulted for small objects. Those are committed
+// inline, which carries the content inside the commit itself, so there is nothing
+// to look up beforehand and nothing to skip.
+func (d *Driver) ObjectExistsByDigest(ctx context.Context, digest string, size int64) (bool, error) {
+	if size <= inlineLimit || !hashRegexp.MatchString(digest) {
+		return false, nil
+	}
+
+	// An object already referenced in the repository needs no further work: the
+	// pointer exists, and the digest is what the client said it is.
+	objectPath := ObjectPath(d.ns, digest)
+	if exists, err := d.client.Exists(ctx, objectPath); err != nil {
+		// A failed probe only costs the client a transfer it could have
+		// skipped, so it must not fail the upload.
+		d.l.Warning("ModelScope object probe for %q failed, will receive the upload: %s", objectPath, err)
+	} else if exists {
+		return true, nil
+	}
+
+	// The object may exist upstream without being referenced here, in which case
+	// only the pointer has to be written.
+	target, err := d.client.Validate(ctx, digest, size)
+	if err != nil {
+		return false, err
+	}
+
+	return target == "", nil
+}
+
+// CommitReference records an upload as a reference to the object already stored
+// for the request's client supplied digest, without receiving any content. It is
+// only called after ObjectExistsByDigest confirmed the object is present.
+func (d *Driver) CommitReference(ctx context.Context, file *fs.UploadRequest) error {
+	digest := file.Props.ClientHash
+	size := file.Props.Size
+
+	if size <= inlineLimit || !hashRegexp.MatchString(digest) {
+		return errors.New("object cannot be referenced without its content")
+	}
+
+	objectPath := ObjectPath(d.ns, digest)
+	if err := d.client.Commit(ctx, []map[string]any{blobAction(objectPath, digest, size)}); err != nil {
+		return err
+	}
+
+	// Record the resolved path so the manager persists it onto the entity, the
+	// same way the content receiving paths do.
+	file.Props.SavePath = objectPath
+	return nil
 }
 
 // OpenStream returns a reader for the object content, supporting both LFS
