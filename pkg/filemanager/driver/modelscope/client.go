@@ -3,6 +3,7 @@ package modelscope
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -139,6 +140,14 @@ func NewClient(endpoint, token, repo, repoType, revision string, l logging.Logge
 	storageTransport := apiTransport.Clone()
 	storageTransport.Proxy = nil
 	storageTransport.DialContext = dialPublicOnly
+	// The storage host moves large objects roughly three times slower over
+	// HTTP/2 than over HTTP/1.1 (a 32 MiB blob takes ~16s versus ~6s), which is
+	// the protocol ModelScope's own client uses for blob transfer. Pin the
+	// storage connection to HTTP/1.1 so blob uploads do not inherit the slower
+	// path. Reads are unaffected either way, so one transport can serve both.
+	storageTransport.ForceAttemptHTTP2 = false
+	storageTransport.TLSClientConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
+	storageTransport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 
 	return &Client{
 		endpoint: strings.TrimRight(endpoint, "/"),

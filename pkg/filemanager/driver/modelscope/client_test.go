@@ -523,3 +523,35 @@ func TestDriverPutRejectsSizeMismatch(t *testing.T) {
 
 	require.Error(t, driver.Put(context.Background(), req))
 }
+
+// TestStorageTransportIsPinnedToHTTP11 guards the reason the storage transport
+// is configured the way it is.
+//
+// The storage host uploads large objects roughly three times slower over HTTP/2
+// than over HTTP/1.1, so the transport serving blob transfer must not negotiate
+// HTTP/2. A silent revert to the default would restore the slow path while every
+// other test kept passing.
+func TestStorageTransportIsPinnedToHTTP11(t *testing.T) {
+	client := newTestClient(t, "https://www.modelscope.cn")
+
+	transport, ok := client.storage.Transport.(*http.Transport)
+	require.True(t, ok, "storage transport should be an *http.Transport")
+
+	require.False(t, transport.ForceAttemptHTTP2,
+		"storage transport must not attempt HTTP/2")
+	require.NotNil(t, transport.TLSClientConfig,
+		"storage transport needs an explicit TLS config to advertise HTTP/1.1 only")
+	require.Equal(t, []string{"http/1.1"}, transport.TLSClientConfig.NextProtos,
+		"storage transport must advertise HTTP/1.1 only")
+	require.NotNil(t, transport.TLSNextProto,
+		"an empty TLSNextProto map is what disables the HTTP/2 upgrade")
+	require.Empty(t, transport.TLSNextProto,
+		"the HTTP/2 upgrade hook must be disabled on the storage transport")
+
+	// The API transport is untouched: metadata calls are small and stay on the
+	// default configuration.
+	apiTransport, ok := client.api.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.True(t, apiTransport.ForceAttemptHTTP2,
+		"api transport should keep the default HTTP/2 behaviour")
+}
