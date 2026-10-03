@@ -3,6 +3,7 @@ package inventory
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"entgo.io/ent/dialect/sql"
@@ -37,6 +38,18 @@ type TaskClient interface {
 	Update(ctx context.Context, task *ent.Task, args *TaskArgs) (*ent.Task, error)
 	// GetPendingTasks returns all pending tasks of given type.
 	GetPendingTasks(ctx context.Context, taskType ...string) ([]*ent.Task, error)
+	// ClaimPendingTask atomically claims a task for execution by the caller.
+	//
+	// Exactly one caller can win a given task, so a task advertised by a queue
+	// backend is never executed twice. allowProcessing must only be set when the
+	// caller knows the task was abandoned rather than merely advertised; see the
+	// implementation for why that distinction is load-bearing.
+	//
+	// The returned model carries the status the task had before the claim rather
+	// than the processing state the row now holds, so that callers driving the task
+	// state machine take the transition matching where the task came from. claimed
+	// is false if the task was already finished, already claimed, or deleted.
+	ClaimPendingTask(ctx context.Context, taskID int, allowProcessing bool) (model *ent.Task, claimed bool, err error)
 	// GetTaskByID returns the task with the given ID.
 	GetTaskByID(ctx context.Context, taskID int) (*ent.Task, error)
 	// SetCompleteByID sets the task with the given ID to complete.
@@ -190,6 +203,74 @@ func (c *taskClient) GetTaskByID(ctx context.Context, taskID int) (*ent.Task, er
 	return withTaskEagerLoading(ctx, c.client.Task.Query()).
 		Where(task.ID(taskID)).
 		First(ctx)
+}
+
+// ClaimPendingTask atomically takes ownership of a task.
+//
+// allowProcessing decides whether a task already marked processing may be claimed.
+// It must only be set for work that has been observed as abandoned. A fresh
+// advertisement never carries it: the task may be running on another instance, and
+// taking it over would execute it twice. A redelivered advertisement does carry it,
+// because the queue backend only redelivers after the previous owner stopped
+// proving it was alive, which is precisely when a task left processing by a dead
+// instance must be recovered.
+//
+// The conditional UPDATE is the distributed claim: exactly one caller can observe
+// ActiveRecordCount() == 1 for a given task, so a task is never claimed twice. A
+// false return means the task was already finished, already claimed, or deleted.
+//
+// The returned model retains the status the task had before the claim rather than
+// the processing state the row now holds, because the caller drives the task state
+// machine from that value: queued -> processing, suspending -> processing and
+// processing -> processing are each handled differently.
+func (c *taskClient) ClaimPendingTask(ctx context.Context, taskID int, allowProcessing bool) (*ent.Task, bool, error) {
+	claimCtx := context.WithValue(ctx, LoadTaskUser{}, true)
+	claimCtx = context.WithValue(claimCtx, LoadUserGroup{}, true)
+
+	model, err := withTaskEagerLoading(claimCtx, c.client.Task.Query()).
+		Where(task.ID(taskID)).
+		Only(ctx)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("failed to load task %d for claiming: %w", taskID, err)
+	}
+
+	allowed := []task.Status{task.StatusQueued, task.StatusSuspending}
+	if allowProcessing {
+		allowed = append(allowed, task.StatusProcessing)
+	}
+	if !slices.Contains(allowed, model.Status) {
+		return nil, false, nil
+	}
+
+	affected, err := c.client.Task.Update().
+		Where(task.ID(taskID)).
+		Where(task.StatusIn(allowed...)).
+		SetStatus(task.StatusProcessing).
+		Save(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to claim task %d: %w", taskID, err)
+	}
+
+	if affected == 0 {
+		return nil, false, nil
+	}
+
+	// Tasks owned by the system (cron-spawned routines, sentinel checks) have no user
+	// edge. GetPendingTasks substitutes the anonymous user for those, and the DB row
+	// itself is left untouched, so the same substitution has to happen here for
+	// ownership checks downstream to see a non-nil owner.
+	if model.UserTasks == 0 {
+		anonymous, err := NewUserClient(c.client).AnonymousUser(claimCtx)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to load anonymous user for task %d: %w", taskID, err)
+		}
+		model.SetUser(anonymous)
+	}
+
+	return model, true, nil
 }
 
 func (c *taskClient) SetCompleteByID(ctx context.Context, taskID int) error {

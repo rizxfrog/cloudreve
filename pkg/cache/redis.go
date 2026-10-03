@@ -45,37 +45,44 @@ func deserializer(value []byte) (any, error) {
 	return res.Value, nil
 }
 
+// NewRedisPool creates a redis connection pool from the given config. It is shared
+// by the KV store and any other component that needs direct Redis access, so that
+// a single pool size budget is applied per config.
+func NewRedisPool(l logging.Logger, size int, redisConfig *conf.Redis) *redis.Pool {
+	return &redis.Pool{
+		MaxIdle:     size,
+		IdleTimeout: 240 * time.Second,
+		TestOnBorrow: func(c redis.Conn, t time.Time) error {
+			_, err := c.Do("PING")
+			return err
+		},
+		Dial: func() (redis.Conn, error) {
+			db, err := strconv.Atoi(redisConfig.DB)
+			if err != nil {
+				return nil, err
+			}
+
+			c, err := redis.Dial(
+				redisConfig.Network,
+				redisConfig.Server,
+				redis.DialDatabase(db),
+				redis.DialPassword(redisConfig.Password),
+				redis.DialUsername(redisConfig.User),
+				redis.DialUseTLS(redisConfig.UseTLS),
+				redis.DialTLSSkipVerify(redisConfig.TLSSkipVerify),
+			)
+			if err != nil {
+				l.Panic("Failed to create Redis connection: %s", err)
+			}
+			return c, nil
+		},
+	}
+}
+
 // NewRedisStore 创建新的redis存储
 func NewRedisStore(l logging.Logger, size int, redisConfig *conf.Redis) *RedisStore {
 	return &RedisStore{
-		pool: &redis.Pool{
-			MaxIdle:     size,
-			IdleTimeout: 240 * time.Second,
-			TestOnBorrow: func(c redis.Conn, t time.Time) error {
-				_, err := c.Do("PING")
-				return err
-			},
-			Dial: func() (redis.Conn, error) {
-				db, err := strconv.Atoi(redisConfig.DB)
-				if err != nil {
-					return nil, err
-				}
-
-				c, err := redis.Dial(
-					redisConfig.Network,
-					redisConfig.Server,
-					redis.DialDatabase(db),
-					redis.DialPassword(redisConfig.Password),
-					redis.DialUsername(redisConfig.User),
-					redis.DialUseTLS(redisConfig.UseTLS),
-					redis.DialTLSSkipVerify(redisConfig.TLSSkipVerify),
-				)
-				if err != nil {
-					l.Panic("Failed to create Redis connection: %s", err)
-				}
-				return c, nil
-			},
-		},
+		pool: NewRedisPool(l, size, redisConfig),
 	}
 }
 

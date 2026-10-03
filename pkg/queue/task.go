@@ -461,7 +461,7 @@ func init() {
 		},
 		task.StatusSuspending: {
 			task.StatusProcessing: func(ctx context.Context, task Task, newStatus task.Status, q *queue) error {
-				q.metric.DecSuspendingTask()
+				q.metric.DscSuspendingTask()
 				return persistTask(ctx, task, newStatus, q)
 			},
 			task.StatusError: func(ctx context.Context, task Task, newStatus task.Status, q *queue) error {

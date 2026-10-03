@@ -3,6 +3,8 @@ package queue
 import (
 	"runtime"
 	"time"
+
+	"github.com/gomodule/redigo/redis"
 )
 
 // An Option configures a mutex.
@@ -28,6 +30,12 @@ type options struct {
 	resumeTaskType     []string
 	workerCount        int
 	name               string
+
+	// streamPool enables a distributed scheduler backed by Redis Streams. It is
+	// nil for queues whose tasks cannot be serialised, or when Redis is not
+	// configured, in which case the queue stays process-local.
+	streamPool     *redis.Pool
+	streamConsumer string
 }
 
 func newDefaultOptions() *options {
@@ -98,6 +106,22 @@ func WithWorkerCount(num int) Option {
 func WithName(name string) Option {
 	return OptionFunc(func(q *options) {
 		q.name = name
+	})
+}
+
+// WithStreamScheduler distributes this queue's tasks over Redis Streams.
+//
+// pool is shared across queues. consumer identifies the running process and must
+// be stable for its lifetime, so that entries it holds can be distinguished from
+// those abandoned by a crashed instance.
+//
+// The caller is responsible for only enabling this on queues whose tasks can be
+// reconstructed from the database, and for ensuring the backing store is actually
+// reachable: a queue that cannot reach Redis cannot dispatch anything.
+func WithStreamScheduler(pool *redis.Pool, consumer string) Option {
+	return OptionFunc(func(q *options) {
+		q.streamPool = pool
+		q.streamConsumer = consumer
 	})
 }
 

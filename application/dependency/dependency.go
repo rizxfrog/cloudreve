@@ -34,6 +34,8 @@ import (
 	"github.com/cloudreve/Cloudreve/v4/pkg/util"
 	"github.com/gin-contrib/static"
 	"github.com/go-webauthn/webauthn/webauthn"
+	"github.com/gofrs/uuid"
+	"github.com/gomodule/redigo/redis"
 	"github.com/robfig/cron/v3"
 	"github.com/samber/lo"
 	"github.com/ua-parser/uap-go/uaparser"
@@ -196,6 +198,14 @@ type dependency struct {
 	eventHub              eventhub.EventHub
 	searchIndexer         searcher.SearchIndexer
 	textExtractor         searcher.TextExtractor
+
+	// Distributed queue support. This pool is deliberately separate from the KV
+	// store's: queue workers hold connections open for seconds at a time inside
+	// blocking reads, and the KV store backs the request path, so sharing a pool
+	// would couple request latency to queue load.
+	queuePool       *redis.Pool
+	queuePoolMu     sync.Mutex
+	queueInstanceID string
 
 	configPath        string
 	isPro             bool
@@ -636,7 +646,7 @@ func (d *dependency) MediaMetaQueue(ctx context.Context) queue.Queue {
 	settings := d.SettingProvider()
 	queueSetting := settings.Queue(context.Background(), setting.QueueTypeMediaMeta)
 
-	d.mediaMetaQueue = queue.New(d.Logger(), d.TaskClient(), nil, d,
+	opts := []queue.Option{
 		queue.WithBackoffFactor(queueSetting.BackoffFactor),
 		queue.WithMaxRetry(queueSetting.MaxRetry),
 		queue.WithBackoffMaxDuration(queueSetting.BackoffMaxDuration),
@@ -652,7 +662,10 @@ func (d *dependency) MediaMetaQueue(ctx context.Context) queue.Queue {
 			queue.FullTextCopyTaskType,
 			queue.FullTextChangeOwnerTaskType,
 		),
-	)
+	}
+	opts = append(opts, d.queueStreamOptions(queueSetting.WorkerNum)...)
+
+	d.mediaMetaQueue = queue.New(d.Logger(), d.TaskClient(), nil, d, opts...)
 	return d.mediaMetaQueue
 }
 
@@ -672,7 +685,7 @@ func (d *dependency) IoIntenseQueue(ctx context.Context) queue.Queue {
 	settings := d.SettingProvider()
 	queueSetting := settings.Queue(context.Background(), setting.QueueTypeIOIntense)
 
-	d.ioIntenseQueue = queue.New(d.Logger(), d.TaskClient(), d.TaskRegistry(), d,
+	opts := []queue.Option{
 		queue.WithBackoffFactor(queueSetting.BackoffFactor),
 		queue.WithMaxRetry(queueSetting.MaxRetry),
 		queue.WithBackoffMaxDuration(queueSetting.BackoffMaxDuration),
@@ -681,8 +694,11 @@ func (d *dependency) IoIntenseQueue(ctx context.Context) queue.Queue {
 		queue.WithName("IoIntenseQueue"),
 		queue.WithMaxTaskExecution(queueSetting.MaxExecution),
 		queue.WithResumeTaskType(queue.CreateArchiveTaskType, queue.ExtractArchiveTaskType, queue.RelocateTaskType, queue.ImportTaskType),
-		queue.WithTaskPullInterval(10*time.Second),
-	)
+		queue.WithTaskPullInterval(10 * time.Second),
+	}
+	opts = append(opts, d.queueStreamOptions(queueSetting.WorkerNum)...)
+
+	d.ioIntenseQueue = queue.New(d.Logger(), d.TaskClient(), d.TaskRegistry(), d, opts...)
 	return d.ioIntenseQueue
 }
 
@@ -702,7 +718,7 @@ func (d *dependency) RemoteDownloadQueue(ctx context.Context) queue.Queue {
 	settings := d.SettingProvider()
 	queueSetting := settings.Queue(context.Background(), setting.QueueTypeRemoteDownload)
 
-	d.remoteDownloadQueue = queue.New(d.Logger(), d.TaskClient(), d.TaskRegistry(), d,
+	opts := []queue.Option{
 		queue.WithBackoffFactor(queueSetting.BackoffFactor),
 		queue.WithMaxRetry(queueSetting.MaxRetry),
 		queue.WithBackoffMaxDuration(queueSetting.BackoffMaxDuration),
@@ -711,8 +727,11 @@ func (d *dependency) RemoteDownloadQueue(ctx context.Context) queue.Queue {
 		queue.WithName("RemoteDownloadQueue"),
 		queue.WithMaxTaskExecution(queueSetting.MaxExecution),
 		queue.WithResumeTaskType(queue.RemoteDownloadTaskType),
-		queue.WithTaskPullInterval(10*time.Second),
-	)
+		queue.WithTaskPullInterval(10 * time.Second),
+	}
+	opts = append(opts, d.queueStreamOptions(queueSetting.WorkerNum)...)
+
+	d.remoteDownloadQueue = queue.New(d.Logger(), d.TaskClient(), d.TaskRegistry(), d, opts...)
 	return d.remoteDownloadQueue
 }
 
@@ -732,7 +751,7 @@ func (d *dependency) EntityRecycleQueue(ctx context.Context) queue.Queue {
 	settings := d.SettingProvider()
 	queueSetting := settings.Queue(context.Background(), setting.QueueTypeEntityRecycle)
 
-	d.entityRecycleQueue = queue.New(d.Logger(), d.TaskClient(), nil, d,
+	opts := []queue.Option{
 		queue.WithBackoffFactor(queueSetting.BackoffFactor),
 		queue.WithMaxRetry(queueSetting.MaxRetry),
 		queue.WithBackoffMaxDuration(queueSetting.BackoffMaxDuration),
@@ -741,8 +760,11 @@ func (d *dependency) EntityRecycleQueue(ctx context.Context) queue.Queue {
 		queue.WithName("EntityRecycleQueue"),
 		queue.WithMaxTaskExecution(queueSetting.MaxExecution),
 		queue.WithResumeTaskType(queue.EntityRecycleRoutineTaskType, queue.ExplicitEntityRecycleTaskType, queue.UploadSentinelCheckTaskType),
-		queue.WithTaskPullInterval(10*time.Second),
-	)
+		queue.WithTaskPullInterval(10 * time.Second),
+	}
+	opts = append(opts, d.queueStreamOptions(queueSetting.WorkerNum)...)
+
+	d.entityRecycleQueue = queue.New(d.Logger(), d.TaskClient(), nil, d, opts...)
 	return d.entityRecycleQueue
 }
 
@@ -906,6 +928,49 @@ func (d *dependency) TaskRegistry() queue.TaskRegistry {
 
 	d.taskRegistry = queue.NewTaskRegistry()
 	return d.taskRegistry
+}
+
+// queueStreamOptions returns the options that put a queue on Redis Streams, or no
+// options at all when Redis is not configured.
+//
+// The pool size is derived from the worker count: each worker may hold one
+// connection inside a blocking read, and the maintenance loops need a few more on
+// top of that.
+func (d *dependency) queueStreamOptions(workerNum int) []queue.Option {
+	config := d.ConfigProvider().Redis()
+	if config.Server == "" {
+		return nil
+	}
+
+	return []queue.Option{
+		queue.WithStreamScheduler(d.QueuePool(workerNum+8), d.queueInstance()),
+	}
+}
+
+// QueuePool returns the Redis pool backing distributed queues.
+func (d *dependency) QueuePool(maxIdle int) *redis.Pool {
+	d.queuePoolMu.Lock()
+	defer d.queuePoolMu.Unlock()
+
+	if d.queuePool == nil {
+		d.queuePool = cache.NewRedisPool(d.Logger(), maxIdle, d.ConfigProvider().Redis())
+	}
+
+	return d.queuePool
+}
+
+// queueInstance identifies this process within a queue consumer group. It is
+// created once so that entries owned by this process remain attributable for its
+// whole lifetime, including across queue reloads.
+func (d *dependency) queueInstance() string {
+	d.queuePoolMu.Lock()
+	defer d.queuePoolMu.Unlock()
+
+	if d.queueInstanceID == "" {
+		d.queueInstanceID = uuid.Must(uuid.NewV4()).String()
+	}
+
+	return d.queueInstanceID
 }
 
 func (d *dependency) Shutdown(ctx context.Context) error {

@@ -36,15 +36,16 @@ type (
 	}
 	queue struct {
 		sync.Mutex
-		routineGroup *routineGroup
-		metric       *metric
-		quit         chan struct{}
-		ready        chan struct{}
-		scheduler    Scheduler
-		stopOnce     sync.Once
-		stopFlag     int32
-		rootCtx      context.Context
-		cancel       context.CancelFunc
+		routineGroup    *routineGroup
+		metric          *metric
+		quit            chan struct{}
+		ready           chan struct{}
+		scheduler       Scheduler
+		streamScheduler *streamScheduler
+		stopOnce        sync.Once
+		stopFlag        int32
+		rootCtx         context.Context
+		cancel          context.CancelFunc
 
 		// Dependencies
 		logger     logging.Logger
@@ -73,9 +74,8 @@ func New(l logging.Logger, taskClient inventory.TaskClient, registry TaskRegistr
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	return &queue{
+	q := &queue{
 		routineGroup: newRoutineGroup(),
-		scheduler:    NewFifoScheduler(0, l),
 		quit:         make(chan struct{}),
 		ready:        make(chan struct{}, 1),
 		metric:       &metric{},
@@ -87,47 +87,114 @@ func New(l logging.Logger, taskClient inventory.TaskClient, registry TaskRegistr
 		rootCtx:      ctx,
 		cancel:       cancel,
 	}
+
+	if o.streamPool != nil {
+		// A distributed queue needs a database-backed task client: the stream only
+		// carries task identities, and the database is what makes a delivery
+		// idempotent. Refusing the configuration is better than silently running a
+		// queue that can advertise work it can never claim.
+		if taskClient == nil {
+			l.Panic("Queue %q cannot use a stream scheduler without a task client", o.name)
+		}
+
+		q.streamScheduler = NewStreamScheduler(l, o.streamPool, o.streamConsumer, o.name, taskClient)
+		q.scheduler = q.streamScheduler
+	} else {
+		q.scheduler = NewFifoScheduler(0, l)
+	}
+
+	return q
 }
 
 // Start to enable all worker
 func (q *queue) Start() {
 	q.routineGroup.Run(func() {
-		// Resume tasks in DB
-		if len(q.options.resumeTaskType) > 0 && q.taskClient != nil {
+		// Resume tasks in DB.
+		//
+		// When a stream scheduler is active, every pending task is already
+		// represented by a stream entry, so an unconditional sweep would
+		// double-advertise tasks that are merely waiting behind their resume time.
+		// The sweep is still run once as a single-instance repair pass, to recover
+		// tasks whose stream entries were lost.
+		streamActive := q.streamScheduler != nil
 
-			ctx := context.TODO()
-			ctx = context.WithValue(ctx, inventory.LoadTaskUser{}, true)
-			ctx = context.WithValue(ctx, inventory.LoadUserGroup{}, true)
-			tasks, err := q.taskClient.GetPendingTasks(ctx, q.resumeTaskType...)
+		if streamActive {
+			if err := q.streamScheduler.Init(q.rootCtx); err != nil {
+				// Without a reachable stream there is no way to dispatch anything, so
+				// the queue is left idle rather than accepting tasks it cannot run.
+				q.logger.Error("Failed to start queue %q: %s", q.name, err)
+				return
+			}
+
+			q.streamScheduler.Start()
+		}
+
+		runRepair := !streamActive
+		if streamActive {
+			acquired, err := q.tryAcquireResumeLock()
 			if err != nil {
-				q.logger.Warning("Failed to get pending tasks from DB for given type %v: %s", q.resumeTaskType, err)
+				q.logger.Warning("Failed to acquire repair lock for queue %q, skipping recovery sweep: %s", q.name, err)
 			}
+			runRepair = acquired
+		}
 
-			resumed := 0
-			for _, t := range tasks {
-				resumedTask, err := NewTaskFromModel(t)
-				if err != nil {
-					q.logger.Warning("Failed to resume task %d: %s", t.ID, err)
-					continue
-				}
-
-				if resumedTask.Status() == task.StatusSuspending {
-					q.metric.IncSuspendingTask()
-					q.metric.IncSubmittedTask()
-				}
-
-				if err := q.QueueTask(ctx, resumedTask); err != nil {
-					q.logger.Warning("Failed to resume task %d: %s", t.ID, err)
-				}
-				resumed++
-			}
-
-			q.logger.Info("Resumed %d tasks from DB.", resumed)
+		if runRepair && len(q.options.resumeTaskType) > 0 && q.taskClient != nil {
+			q.resumePendingTasks()
 		}
 
 		q.start()
 	})
 	q.logger.Info("Queue %q started with %d workers.", q.name, q.workerCount)
+}
+
+// tryAcquireResumeLock acquires the single-instance lock guarding the startup
+// repair pass.
+func (q *queue) tryAcquireResumeLock() (bool, error) {
+	if q.streamScheduler == nil {
+		return false, nil
+	}
+
+	return q.streamScheduler.tryAcquireRepairLock()
+}
+
+// resumePendingTasks re-advertises tasks that were left pending by a previous
+// process. Enqueuing an already advertised task is not a duplicate submission from
+// the queue's point of view: the scheduler deduplicates it and the resulting
+// queued -> processing transition is a no-op.
+func (q *queue) resumePendingTasks() {
+	ctx := context.TODO()
+	ctx = context.WithValue(ctx, inventory.LoadTaskUser{}, true)
+	ctx = context.WithValue(ctx, inventory.LoadUserGroup{}, true)
+	// The sweep only ever sees database state, so it must be able to recover tasks
+	// left processing by an instance that no longer exists.
+	ctx = context.WithValue(ctx, repairCtx{}, true)
+
+	tasks, err := q.taskClient.GetPendingTasks(ctx, q.resumeTaskType...)
+	if err != nil {
+		q.logger.Warning("Failed to get pending tasks from DB for given type %v: %s", q.resumeTaskType, err)
+		return
+	}
+
+	resumed := 0
+	for _, t := range tasks {
+		resumedTask, err := NewTaskFromModel(t)
+		if err != nil {
+			q.logger.Warning("Failed to resume task %d: %s", t.ID, err)
+			continue
+		}
+
+		if resumedTask.Status() == task.StatusSuspending {
+			q.metric.IncSuspendingTask()
+			q.metric.IncSubmittedTask()
+		}
+
+		if err := q.QueueTask(ctx, resumedTask); err != nil {
+			q.logger.Warning("Failed to resume task %d: %s", t.ID, err)
+		}
+		resumed++
+	}
+
+	q.logger.Info("Resumed %d tasks from DB.", resumed)
 }
 
 // Shutdown stops all queues.
@@ -193,7 +260,7 @@ func (q *queue) QueueTask(ctx context.Context, t Task) error {
 		}
 	}
 
-	if err := q.scheduler.Queue(t); err != nil {
+	if err := q.scheduler.Queue(ctx, t); err != nil {
 		return err
 	}
 	owner := ""
@@ -235,6 +302,16 @@ func (q *queue) work(t Task) {
 
 			_ = q.transitStatus(ctx, t, task.StatusError)
 		}
+
+		// Release the task back to the scheduler once the worker is done with it,
+		// whatever the outcome. A remote backend uses this to settle its delivery
+		// bookkeeping; a local one treats it as a no-op. WithoutCancel keeps the
+		// acknowledgement reachable while the queue is shutting down, which is
+		// exactly when a task must not be silently dropped.
+		if err := q.scheduler.Ack(context.WithoutCancel(ctx), t); err != nil {
+			l.Warning("Failed to acknowledge task %d: %s", t.ID(), err)
+		}
+
 		q.schedule()
 	}()
 
@@ -395,7 +472,9 @@ func (q *queue) start() {
 		// request Task from queue in background
 		q.routineGroup.Run(func() {
 			for {
-				t, err := q.scheduler.Request()
+				// The root context is used so that shutting the queue down cancels
+				// any blocking backend read instead of waiting for its timeout.
+				t, err := q.scheduler.Request(q.rootCtx)
 				if t == nil || err != nil {
 					if err != nil {
 						select {
