@@ -63,6 +63,53 @@ func TestNormalizePolicyRejectsInvalidModelScopeSettings(t *testing.T) {
 			SecretKey:  "token",
 			Settings:   &types.PolicySetting{ModelScopeNamespace: "001"},
 		},
+		"negative commit interval": {
+			Type:       types.PolicyTypeModelScope,
+			BucketName: "owner/repo",
+			SecretKey:  "token",
+			Settings: &types.PolicySetting{
+				ModelScopeQueueCommit:       true,
+				ModelScopeCommitIntervalMin: -1,
+			},
+		},
+		"inverted commit interval": {
+			Type:       types.PolicyTypeModelScope,
+			BucketName: "owner/repo",
+			SecretKey:  "token",
+			Settings: &types.PolicySetting{
+				ModelScopeQueueCommit:       true,
+				ModelScopeCommitIntervalMin: 9,
+				ModelScopeCommitIntervalMax: 3,
+			},
+		},
+		"both commit modes": {
+			Type:       types.PolicyTypeModelScope,
+			BucketName: "owner/repo",
+			SecretKey:  "token",
+			Settings: &types.PolicySetting{
+				ModelScopeQueueCommit: true,
+				ModelScopeBatchCommit: true,
+			},
+		},
+		"negative batch window": {
+			Type:       types.PolicyTypeModelScope,
+			BucketName: "owner/repo",
+			SecretKey:  "token",
+			Settings: &types.PolicySetting{
+				ModelScopeBatchCommit:    true,
+				ModelScopeBatchWindowMin: -1,
+			},
+		},
+		"inverted batch window": {
+			Type:       types.PolicyTypeModelScope,
+			BucketName: "owner/repo",
+			SecretKey:  "token",
+			Settings: &types.PolicySetting{
+				ModelScopeBatchCommit:    true,
+				ModelScopeBatchWindowMin: 9,
+				ModelScopeBatchWindowMax: 3,
+			},
+		},
 	}
 
 	for name, policy := range cases {
@@ -95,4 +142,39 @@ func TestNormalizePolicyForcesRelayOnExistingModelScopePolicy(t *testing.T) {
 	require.Equal(t, "models", policy.Settings.ModelScopeRepoType)
 	require.Equal(t, "v1.0", policy.Settings.ModelScopeRevision)
 	require.Equal(t, "42", policy.Settings.ModelScopeNamespace)
+}
+
+func TestNormalizePolicyAcceptsModelScopeCommitQueue(t *testing.T) {
+	// A zero bound means "use the default", so it must not be rejected just
+	// because the other bound is set.
+	policy := &ent.StoragePolicy{
+		Type:       types.PolicyTypeModelScope,
+		BucketName: "owner/repo",
+		SecretKey:  "token",
+		Settings: &types.PolicySetting{
+			ModelScopeQueueCommit:       true,
+			ModelScopeCommitIntervalMin: 3,
+			ModelScopeCommitIntervalMax: 5,
+		},
+	}
+
+	require.NoError(t, normalizePolicy(policy))
+	require.Equal(t, 3, policy.Settings.ModelScopeCommitIntervalMin)
+	require.Equal(t, 5, policy.Settings.ModelScopeCommitIntervalMax)
+}
+
+func TestNormalizePolicyIgnoresCommitIntervalWhenQueueDisabled(t *testing.T) {
+	// The range is only meaningful with queuing on, so an unused inverted range
+	// must not block an otherwise valid policy.
+	policy := &ent.StoragePolicy{
+		Type:       types.PolicyTypeModelScope,
+		BucketName: "owner/repo",
+		SecretKey:  "token",
+		Settings: &types.PolicySetting{
+			ModelScopeCommitIntervalMin: 9,
+			ModelScopeCommitIntervalMax: 3,
+		},
+	}
+
+	require.NoError(t, normalizePolicy(policy))
 }

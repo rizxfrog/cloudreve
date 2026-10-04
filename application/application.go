@@ -124,6 +124,9 @@ func (s *server) Start() error {
 		s.dep.SlaveQueue(context.Background()).Start()
 	}
 	s.dep.ThumbQueue(context.Background()).Start()
+	// Commits can be routed from an upload accepted on either a master or a
+	// slave node, so this queue runs in both modes.
+	s.dep.ModelScopeCommitQueue(context.Background()).Start()
 
 	api := routers.InitRouter(s.dep)
 	api.TrustedPlatform = s.config.System().ProxyHeader

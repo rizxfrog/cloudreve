@@ -130,6 +130,8 @@ type Dep interface {
 	IoIntenseQueue(ctx context.Context) queue.Queue
 	// RemoteDownloadQueue Get a singleton queue.Queue instance for remote download tasks.
 	RemoteDownloadQueue(ctx context.Context) queue.Queue
+	// ModelScopeCommitQueue Get a singleton queue.Queue instance for ModelScope repository commits.
+	ModelScopeCommitQueue(ctx context.Context) queue.Queue
 	// NodePool Get a singleton cluster.NodePool instance for node pool management.
 	NodePool(ctx context.Context) (cluster.NodePool, error)
 	// TaskRegistry Get a singleton queue.TaskRegistry instance for task registration.
@@ -184,6 +186,7 @@ type dependency struct {
 	entityRecycleQueue    queue.Queue
 	slaveQueue            queue.Queue
 	remoteDownloadQueue   queue.Queue
+	modelScopeCommitQueue queue.Queue
 	ioIntenseQueueTask    queue.Task
 	mediaMeta             mediameta.Extractor
 	thumbPipeline         thumb.Generator
@@ -735,6 +738,42 @@ func (d *dependency) RemoteDownloadQueue(ctx context.Context) queue.Queue {
 	return d.remoteDownloadQueue
 }
 
+// ModelScopeCommitQueue returns the queue that serializes ModelScope repository
+// commits.
+//
+// It never uses the distributed scheduler: its tasks carry a repository commit
+// and a result channel that belongs to the waiting request, so they cannot be
+// serialised to Redis or resumed after a restart. Ordering is enforced by the
+// driver's per-repository pacer in any case, which keeps the queue a
+// process-local scheduling detail.
+func (d *dependency) ModelScopeCommitQueue(ctx context.Context) queue.Queue {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, reload := ctx.Value(ReloadCtx{}).(bool)
+	if d.modelScopeCommitQueue != nil && !reload {
+		return d.modelScopeCommitQueue
+	}
+
+	if d.modelScopeCommitQueue != nil {
+		d.modelScopeCommitQueue.Shutdown()
+	}
+
+	settings := d.SettingProvider()
+	queueSetting := settings.Queue(context.Background(), setting.QueueTypeModelScopeCommit)
+
+	d.modelScopeCommitQueue = queue.New(d.Logger(), nil, nil, d,
+		queue.WithBackoffFactor(queueSetting.BackoffFactor),
+		queue.WithMaxRetry(queueSetting.MaxRetry),
+		queue.WithBackoffMaxDuration(queueSetting.BackoffMaxDuration),
+		queue.WithRetryDelay(queueSetting.RetryDelay),
+		queue.WithWorkerCount(queueSetting.WorkerNum),
+		queue.WithName("ModelScopeCommitQueue"),
+		queue.WithMaxTaskExecution(queueSetting.MaxExecution),
+	)
+	return d.modelScopeCommitQueue
+}
+
 func (d *dependency) EntityRecycleQueue(ctx context.Context) queue.Queue {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1026,6 +1065,14 @@ func (d *dependency) Shutdown(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			d.remoteDownloadQueue.Shutdown()
+			defer wg.Done()
+		}()
+	}
+
+	if d.modelScopeCommitQueue != nil {
+		wg.Add(1)
+		go func() {
+			d.modelScopeCommitQueue.Shutdown()
 			defer wg.Done()
 		}()
 	}

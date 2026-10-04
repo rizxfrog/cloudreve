@@ -330,6 +330,46 @@ func normalizePolicy(policy *ent.StoragePolicy) error {
 		return serializer.NewError(serializer.CodeParamErr, "ModelScope namespace must be exactly two digits", nil)
 	}
 
+	// Queued commits and windowed merging are two answers to the same problem
+	// and cannot be combined: one delays every commit, the other merges commits
+	// together, and together they would both delay and merge with no defined
+	// result. The mode is chosen explicitly.
+	if policy.Settings.ModelScopeQueueCommit && policy.Settings.ModelScopeBatchCommit {
+		return serializer.NewError(serializer.CodeParamErr,
+			"ModelScope queued commits and windowed batch commits cannot be enabled at the same time", nil)
+	}
+
+	// Each mode's range only has to be sane when that mode is on. Zero means
+	// "use the default", so only a negative bound or an inverted range is
+	// rejected.
+	if policy.Settings.ModelScopeQueueCommit {
+		minInterval := policy.Settings.ModelScopeCommitIntervalMin
+		maxInterval := policy.Settings.ModelScopeCommitIntervalMax
+
+		if minInterval < 0 || maxInterval < 0 {
+			return serializer.NewError(serializer.CodeParamErr, "ModelScope commit interval must not be negative", nil)
+		}
+
+		if maxInterval > 0 && minInterval > maxInterval {
+			return serializer.NewError(serializer.CodeParamErr,
+				"ModelScope commit interval min must not exceed max", nil)
+		}
+	}
+
+	if policy.Settings.ModelScopeBatchCommit {
+		minWindow := policy.Settings.ModelScopeBatchWindowMin
+		maxWindow := policy.Settings.ModelScopeBatchWindowMax
+
+		if minWindow < 0 || maxWindow < 0 {
+			return serializer.NewError(serializer.CodeParamErr, "ModelScope batch window must not be negative", nil)
+		}
+
+		if maxWindow > 0 && minWindow > maxWindow {
+			return serializer.NewError(serializer.CodeParamErr,
+				"ModelScope batch window min must not exceed max", nil)
+		}
+	}
+
 	return nil
 }
 

@@ -27,6 +27,7 @@ func GetQueueMetrics(c *gin.Context) ([]QueueMetric, error) {
 	ioIntense := dep.IoIntenseQueue(c)
 	remoteDownload := dep.RemoteDownloadQueue(c)
 	thumb := dep.ThumbQueue(c)
+	modelScopeCommit := dep.ModelScopeCommitQueue(c)
 
 	res = append(res, QueueMetric{
 		Name:            setting.QueueTypeMediaMeta,
@@ -67,6 +68,14 @@ func GetQueueMetrics(c *gin.Context) ([]QueueMetric, error) {
 		FailureTasks:    thumb.FailureTasks(),
 		SubmittedTasks:  thumb.SubmittedTasks(),
 		SuspendingTasks: thumb.SuspendingTasks(),
+	})
+	res = append(res, QueueMetric{
+		Name:            setting.QueueTypeModelScopeCommit,
+		BusyWorkers:     modelScopeCommit.BusyWorkers(),
+		SuccessTasks:    modelScopeCommit.SuccessTasks(),
+		FailureTasks:    modelScopeCommit.FailureTasks(),
+		SubmittedTasks:  modelScopeCommit.SubmittedTasks(),
+		SuspendingTasks: modelScopeCommit.SuspendingTasks(),
 	})
 
 	return res, nil

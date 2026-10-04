@@ -19,6 +19,7 @@ import (
 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/driver/s3"
 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/driver/upyun"
 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/fs"
+	"github.com/cloudreve/Cloudreve/v4/pkg/queue"
 	"github.com/cloudreve/Cloudreve/v4/pkg/serializer"
 )
 
@@ -27,6 +28,20 @@ func (m *manager) LocalDriver(policy *ent.StoragePolicy) driver.Handler {
 		policy = &ent.StoragePolicy{Type: types.PolicyTypeLocal, Settings: &types.PolicySetting{}}
 	}
 	return local.New(policy, m.l, m.config)
+}
+
+// modelScopeCommitQueue returns the queue that serializes ModelScope commits,
+// or nil on a stateless node.
+//
+// A stateless node (slave) holds no database and never starts the commit queue,
+// so returning nil there lets the driver keep the randomized spacing inline
+// rather than submitting tasks nothing would ever run.
+func (m *manager) modelScopeCommitQueue(ctx context.Context) queue.Queue {
+	if m.stateless {
+		return nil
+	}
+
+	return m.dep.ModelScopeCommitQueue(ctx)
 }
 
 func (m *manager) CastStoragePolicyOnSlave(ctx context.Context, policy *ent.StoragePolicy) *ent.StoragePolicy {
@@ -86,7 +101,7 @@ func (m *manager) GetStorageDriver(ctx context.Context, policy *ent.StoragePolic
 	case types.PolicyTypeOd:
 		return onedrive.New(ctx, policy, m.settings, m.config, m.l, m.dep.CredManager())
 	case types.PolicyTypeModelScope:
-		return modelscope.New(ctx, policy, m.settings, m.config, m.l)
+		return modelscope.New(ctx, policy, m.settings, m.config, m.modelScopeCommitQueue(ctx), m.l)
 	default:
 		return nil, ErrUnknownPolicyType
 	}

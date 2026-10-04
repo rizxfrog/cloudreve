@@ -113,6 +113,26 @@ type (
 		// ModelScopeNamespace is the two-digit directory prefix of the physical
 		// object path inside the repository.
 		ModelScopeNamespace string `json:"modelscope_namespace,omitempty"`
+		// ModelScopeQueueCommit serializes this repository's commits and spaces
+		// them apart, because ModelScope rejects commits submitted too close
+		// together.
+		ModelScopeQueueCommit bool `json:"modelscope_queue_commit,omitempty"`
+		// ModelScopeCommitIntervalMin is the lower bound, in seconds, of the
+		// randomized delay inserted between consecutive commits.
+		ModelScopeCommitIntervalMin int `json:"modelscope_commit_interval_min,omitempty"`
+		// ModelScopeCommitIntervalMax is the upper bound, in seconds, of the
+		// randomized delay inserted between consecutive commits.
+		ModelScopeCommitIntervalMax int `json:"modelscope_commit_interval_max,omitempty"`
+		// ModelScopeBatchCommit merges the commits arriving inside a random
+		// time window into a single repository commit. It is mutually exclusive
+		// with ModelScopeQueueCommit.
+		ModelScopeBatchCommit bool `json:"modelscope_batch_commit,omitempty"`
+		// ModelScopeBatchWindowMin is the lower bound, in seconds, of the random
+		// window during which commits are merged.
+		ModelScopeBatchWindowMin int `json:"modelscope_batch_window_min,omitempty"`
+		// ModelScopeBatchWindowMax is the upper bound, in seconds, of the random
+		// window during which commits are merged.
+		ModelScopeBatchWindowMax int `json:"modelscope_batch_window_max,omitempty"`
 	}
 
 	FileType         int

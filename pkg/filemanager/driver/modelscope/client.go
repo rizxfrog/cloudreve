@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cloudreve/Cloudreve/v4/pkg/logging"
+	"github.com/cloudreve/Cloudreve/v4/pkg/queue"
 )
 
 // inlineLimit is the largest object ModelScope stores as an inline, base64
@@ -106,7 +107,49 @@ type Client struct {
 	// connect to non-public addresses.
 	storage *http.Client
 
+	// commitRunner executes a repository commit. It defaults to the direct HTTP
+	// write and is replaced when the policy routes commits through a queue.
+	commitRunner func(ctx context.Context, actions []map[string]any) error
+
 	l logging.Logger
+}
+
+// SetCommitQueue routes every commit of this client through q, spacing
+// consecutive commits of the same repository by a random interval in
+// [minInterval, maxInterval].
+//
+// Commits are serialized rather than run inline because ModelScope rejects
+// commits submitted too close together. A nil queue keeps the spacing but runs
+// inline, which is what a stateless node has available.
+func (c *Client) SetCommitQueue(q queue.Queue, minInterval, maxInterval time.Duration) {
+	minInterval, maxInterval = normalizeCommitInterval(minInterval, maxInterval, c.l)
+	pacer := sharedCommitPacers.forRepository(commitQueueKey(c.endpoint, c.repoType, c.repo, c.revision))
+
+	if q == nil {
+		c.commitRunner = func(ctx context.Context, actions []map[string]any) error {
+			return pacer.run(ctx, minInterval, maxInterval, func() error {
+				return c.commit(ctx, actions)
+			})
+		}
+		return
+	}
+
+	c.commitRunner = newQueuedCommitRunner(c, q, pacer, minInterval, maxInterval).run
+}
+
+// SetCommitBatch merges the commits of this repository that arrive inside a
+// random window in [minWindow, maxWindow] into a single repository commit.
+//
+// It is the alternative to SetCommitQueue for the same upstream constraint:
+// instead of delaying every commit, the commits of a burst are combined into
+// one request. The merge loop is shared per repository, because the commits to
+// combine come from concurrent requests that each build their own client.
+func (c *Client) SetCommitBatch(minWindow, maxWindow time.Duration) {
+	minWindow, maxWindow = normalizeBatchWindow(minWindow, maxWindow, c.l)
+	c.commitRunner = sharedCommitBatchers.forRepository(
+		commitQueueKey(c.endpoint, c.repoType, c.repo, c.revision),
+		minWindow, maxWindow, c.commit, c.l,
+	).submit
 }
 
 // NewClient constructs a ModelScope API client. endpoint is the site origin,
@@ -149,7 +192,7 @@ func NewClient(endpoint, token, repo, repoType, revision string, l logging.Logge
 	storageTransport.TLSClientConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
 	storageTransport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 
-	return &Client{
+	client := &Client{
 		endpoint: strings.TrimRight(endpoint, "/"),
 		token:    token,
 		repo:     repo,
@@ -168,7 +211,9 @@ func NewClient(endpoint, token, repo, repoType, revision string, l logging.Logge
 			},
 		},
 		l: l,
-	}, nil
+	}
+
+	return client, nil
 }
 
 // dialPublicOnly resolves the target host and refuses to connect unless every
@@ -499,11 +544,23 @@ func (c *Client) Put(ctx context.Context, target, hash string, r io.Reader, size
 
 // Commit writes blob pointers and inline documents in a single repository
 // commit. Each entry of actions is created atomically with the rest.
+//
+// The write is delegated to commitRunner, which is the direct HTTP call unless
+// the policy routes commits through the commit queue.
 func (c *Client) Commit(ctx context.Context, actions []map[string]any) error {
 	if len(actions) == 0 {
 		return nil
 	}
 
+	if c.commitRunner != nil {
+		return c.commitRunner(ctx, actions)
+	}
+
+	return c.commit(ctx, actions)
+}
+
+// commit performs the repository commit request itself, without queuing.
+func (c *Client) commit(ctx context.Context, actions []map[string]any) error {
 	payload := map[string]any{
 		"commit_message": "Cloudreve store",
 		"actions":        actions,

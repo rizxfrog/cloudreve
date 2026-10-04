@@ -662,6 +662,22 @@ func (s *settingProvider) FTSChunkSize(ctx context.Context) int {
 
 func (s *settingProvider) Queue(ctx context.Context, queueType QueueType) *QueueSetting {
 	queueTypeStr := string(queueType)
+
+	// The commit queue serializes repository writes, so its fallback is a single
+	// worker rather than the general parallelism used by every other queue. An
+	// install created before the queue existed has no stored value for it and
+	// would otherwise pick up the generic default.
+	if queueType == QueueTypeModelScopeCommit {
+		return &QueueSetting{
+			WorkerNum:          s.getInt(ctx, "queue_"+queueTypeStr+"_worker_num", 1),
+			MaxExecution:       time.Duration(s.getInt(ctx, "queue_"+queueTypeStr+"_max_execution", 300)) * time.Second,
+			BackoffFactor:      s.getFloat64(ctx, "queue_"+queueTypeStr+"_backoff_factor", 2),
+			BackoffMaxDuration: time.Duration(s.getInt(ctx, "queue_"+queueTypeStr+"_backoff_max_duration", 60)) * time.Second,
+			MaxRetry:           s.getInt(ctx, "queue_"+queueTypeStr+"_max_retry", 0),
+			RetryDelay:         time.Duration(s.getInt(ctx, "queue_"+queueTypeStr+"_retry_delay", 0)) * time.Second,
+		}
+	}
+
 	return &QueueSetting{
 		WorkerNum:          s.getInt(ctx, "queue_"+queueTypeStr+"_worker_num", 15),
 		MaxExecution:       time.Duration(s.getInt(ctx, "queue_"+queueTypeStr+"_max_execution", 86400)) * time.Second,

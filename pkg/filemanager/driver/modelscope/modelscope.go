@@ -19,6 +19,7 @@ import (
 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/driver"
 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/fs"
 	"github.com/cloudreve/Cloudreve/v4/pkg/logging"
+	"github.com/cloudreve/Cloudreve/v4/pkg/queue"
 	"github.com/cloudreve/Cloudreve/v4/pkg/setting"
 )
 
@@ -71,8 +72,13 @@ type Driver struct {
 }
 
 // New constructs a ModelScope storage driver.
+//
+// commitQueue, when non-nil, is the queue that serializes repository commits.
+// It is supplied by the manager and is nil on the stateless (slave) path, where
+// the driver still waits for the randomized interval inline so the pacing holds
+// even without a queue.
 func New(ctx context.Context, policy *ent.StoragePolicy, settings setting.Provider,
-	config conf.ConfigProvider, l logging.Logger) (*Driver, error) {
+	config conf.ConfigProvider, commitQueue queue.Queue, l logging.Logger) (*Driver, error) {
 	policySettings := policy.Settings
 	if policySettings == nil {
 		policySettings = &types.PolicySetting{}
@@ -105,6 +111,28 @@ func New(ctx context.Context, policy *ent.StoragePolicy, settings setting.Provid
 	client, err := NewClient(endpoint, policy.SecretKey, policy.BucketName, repoType, revision, l)
 	if err != nil {
 		return nil, err
+	}
+
+	// Commit pacing is a per-policy choice between two mutually exclusive
+	// modes: queued commits space every commit out, windowed commits merge the
+	// commits of a burst into one. The admin API rejects a policy that enables
+	// both; if a row predating that check does, queued commits win, because
+	// spacing a commit is the more conservative failure.
+	//
+	// The ranges are normalized inside Set*, so a policy saved outside the
+	// admin API cannot invert one.
+	if policySettings.ModelScopeQueueCommit {
+		client.SetCommitQueue(commitQueue,
+			time.Duration(policySettings.ModelScopeCommitIntervalMin)*time.Second,
+			time.Duration(policySettings.ModelScopeCommitIntervalMax)*time.Second,
+		)
+		l.Info("ModelScope queued commits enabled for repository %q", policy.BucketName)
+	} else if policySettings.ModelScopeBatchCommit {
+		client.SetCommitBatch(
+			time.Duration(policySettings.ModelScopeBatchWindowMin)*time.Second,
+			time.Duration(policySettings.ModelScopeBatchWindowMax)*time.Second,
+		)
+		l.Info("ModelScope windowed batch commits enabled for repository %q", policy.BucketName)
 	}
 
 	return &Driver{
