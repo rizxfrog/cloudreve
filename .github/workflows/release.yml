@@ -1,7 +1,9 @@
 name: Release
 
 # Tag pushes run a full release build. The manual trigger rebuilds an already
-# existing tag without pushing a new one.
+# existing tag without pushing a new one. The frontend revision comes from the
+# "frontend" submodule unless a manual run overrides it, so the released assets
+# match the commit the backend records.
 on:
   push:
     tags:
@@ -13,12 +15,10 @@ on:
         description: "Existing tag to release"
         required: true
       frontend_repo:
-        description: "Frontend repository (owner/name)"
-        default: "cloudreve/frontend"
+        description: "Frontend repository (owner/name); empty uses the pinned submodule"
         required: false
       frontend_ref:
-        description: "Frontend git ref (branch, tag or SHA)"
-        default: "master"
+        description: "Frontend git ref (branch, tag or SHA); empty uses the pinned submodule commit"
         required: false
 
 permissions:
@@ -37,17 +37,14 @@ jobs:
         id: params
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            {
-              echo "tag=${{ inputs.tag }}"
-              echo "frontend_repo=${{ inputs.frontend_repo }}"
-              echo "frontend_ref=${{ inputs.frontend_ref }}"
-            } >> "$GITHUB_OUTPUT"
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "frontend_repo=${{ inputs.frontend_repo }}" >> "$GITHUB_OUTPUT"
+            echo "frontend_ref=${{ inputs.frontend_ref }}" >> "$GITHUB_OUTPUT"
           else
-            {
-              echo "tag=${GITHUB_REF_NAME}"
-              echo "frontend_repo=cloudreve/frontend"
-              echo "frontend_ref=master"
-            } >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            # Leave both empty so the checkout step falls back to the submodule.
+            echo "frontend_repo=" >> "$GITHUB_OUTPUT"
+            echo "frontend_ref=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Checkout backend
@@ -56,12 +53,24 @@ jobs:
           ref: ${{ steps.params.outputs.tag }}
           fetch-depth: 0
 
-      # The frontend is a separate repository. It is checked out into ./frontend
-      # because .build/build-assets.sh reads it from there and packs the built
-      # assets into application/statics/assets.zip for the go:embed directive.
-      # For a private frontend repo set the FRONTEND_TOKEN secret to a token
-      # that can read it.
-      - name: Checkout frontend
+      # The frontend is a separate repository, checked out into ./frontend because
+      # .build/build-assets.sh reads it from there and packs the built assets into
+      # application/statics/assets.zip for the go:embed directive.
+      #
+      # By default it comes from the "frontend" submodule, so a release carries the
+      # revision this commit pins rather than whatever upstream points at. A manual
+      # run can override the repository and ref, which is what the FRONTEND_TOKEN
+      # secret is for when that repository is private.
+      - name: Checkout frontend from the pinned submodule
+        if: steps.params.outputs.frontend_repo == ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.params.outputs.tag }}
+          submodules: recursive
+          token: ${{ secrets.FRONTEND_TOKEN || github.token }}
+
+      - name: Checkout frontend from an explicit override
+        if: steps.params.outputs.frontend_repo != ''
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.params.outputs.frontend_repo }}
