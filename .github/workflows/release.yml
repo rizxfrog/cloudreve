@@ -1,9 +1,12 @@
 name: Release
 
 # Tag pushes run a full release build. The manual trigger rebuilds an already
-# existing tag without pushing a new one. The frontend revision comes from the
-# "frontend" submodule unless a manual run overrides it, so the released assets
-# match the commit the backend records.
+# existing tag without pushing a new one.
+#
+# A release build looks for a frontend tag carrying the same name as the backend
+# tag, so shipping a release is one tag on each repository rather than a submodule
+# bump commit on the backend. The submodule pin is the fallback for when no such
+# frontend tag exists.
 on:
   push:
     tags:
@@ -15,10 +18,10 @@ on:
         description: "Existing tag to release"
         required: true
       frontend_repo:
-        description: "Frontend repository (owner/name); empty uses the pinned submodule"
+        description: "Frontend repository (owner/name); empty resolves it from the submodule"
         required: false
       frontend_ref:
-        description: "Frontend git ref (branch, tag or SHA); empty uses the pinned submodule commit"
+        description: "Frontend git ref (branch, tag or SHA); empty uses the tag matching the backend tag"
         required: false
 
 permissions:
@@ -42,7 +45,7 @@ jobs:
             echo "frontend_ref=${{ inputs.frontend_ref }}" >> "$GITHUB_OUTPUT"
           else
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-            # Leave both empty so the checkout step falls back to the submodule.
+            # Leave both empty: the frontend is resolved from the pushed tag below.
             echo "frontend_repo=" >> "$GITHUB_OUTPUT"
             echo "frontend_ref=" >> "$GITHUB_OUTPUT"
           fi
@@ -53,28 +56,81 @@ jobs:
           ref: ${{ steps.params.outputs.tag }}
           fetch-depth: 0
 
-      # The frontend is a separate repository, checked out into ./frontend because
-      # .build/build-assets.sh reads it from there and packs the built assets into
-      # application/statics/assets.zip for the go:embed directive.
+      # Resolve which frontend revision this release should carry.
       #
-      # By default it comes from the "frontend" submodule, so a release carries the
-      # revision this commit pins rather than whatever upstream points at. A manual
-      # run can override the repository and ref, which is what the FRONTEND_TOKEN
-      # secret is for when that repository is private.
-      - name: Checkout frontend from the pinned submodule
-        if: steps.params.outputs.frontend_repo == ''
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.params.outputs.tag }}
-          submodules: recursive
-          token: ${{ secrets.FRONTEND_TOKEN || github.token }}
+      # The frontend repository defaults to the one the "frontend" submodule points
+      # at, so this follows a fork or a rename without editing the workflow.
+      #
+      # The revision is the frontend tag whose name matches the backend tag, which
+      # makes a release "tag both repositories the same". When that tag is absent the
+      # submodule pin is used instead, so a release is never blocked on the frontend
+      # having been tagged -- it just ships the revision the backend records.
+      #
+      # Only the repository is inspected here, not the tag: actions/checkout already
+      # fails with "couldn't find remote ref" when the ref is missing, which is
+      # louder than a silent fallback would be. The exception is an explicit override,
+      # where the requested ref is taken at face value.
+      - name: Resolve frontend revision
+        id: frontend
+        env:
+          TAG: ${{ steps.params.outputs.tag }}
+          OVERRIDE_REPO: ${{ steps.params.outputs.frontend_repo }}
+          OVERRIDE_REF: ${{ steps.params.outputs.frontend_ref }}
+          FRONTEND_TOKEN: ${{ secrets.FRONTEND_TOKEN }}
+        run: |
+          set -euo pipefail
 
-      - name: Checkout frontend from an explicit override
-        if: steps.params.outputs.frontend_repo != ''
+          if [ -n "$OVERRIDE_REPO" ]; then
+            if [ -z "$OVERRIDE_REF" ]; then
+              echo "::error::frontend_ref is required when frontend_repo is set"
+              exit 1
+            fi
+            echo "repo=$OVERRIDE_REPO" >> "$GITHUB_OUTPUT"
+            echo "ref=$OVERRIDE_REF" >> "$GITHUB_OUTPUT"
+            echo "source=override" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Derive the default repository from the submodule rather than hardcoding it.
+          url="$(git config -f .gitmodules submodule.frontend.url)"
+          repo="$(printf '%s' "$url" | sed -E 's#^https://[^/]+/##; s#^git@[^:]+:##; s#\.git$##')"
+          pin="$(git rev-parse "HEAD:frontend")"
+
+          if [ -z "$repo" ] || [ -z "$pin" ]; then
+            echo "::error::could not derive the frontend repository or pin from the submodule"
+            exit 1
+          fi
+
+          # Probe anonymously unless a token is configured. The workflow's own
+          # GITHUB_TOKEN is scoped to this repository and is not accepted as a
+          # credential for a different one, so attaching it here would turn a
+          # readable public repository into a failed lookup.
+          if [ -n "$FRONTEND_TOKEN" ]; then
+            probe="https://x-access-token:${FRONTEND_TOKEN}@github.com/${repo}.git"
+          else
+            probe="https://github.com/${repo}.git"
+          fi
+
+          if git ls-remote --tags --exit-code "$probe" "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "repo=$repo" >> "$GITHUB_OUTPUT"
+            echo "ref=$TAG" >> "$GITHUB_OUTPUT"
+            echo "source=tag" >> "$GITHUB_OUTPUT"
+            echo "Using frontend tag ${TAG} from ${repo}."
+          else
+            echo "repo=$repo" >> "$GITHUB_OUTPUT"
+            echo "ref=$pin" >> "$GITHUB_OUTPUT"
+            echo "source=pin" >> "$GITHUB_OUTPUT"
+            echo "::warning::no frontend tag ${TAG} in ${repo}; falling back to the pinned submodule commit ${pin}."
+          fi
+
+      # The frontend is checked out into ./frontend because .build/build-assets.sh
+      # reads it from there and packs the built assets into
+      # application/statics/assets.zip for the go:embed directive.
+      - name: Checkout frontend
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.params.outputs.frontend_repo }}
-          ref: ${{ steps.params.outputs.frontend_ref }}
+          repository: ${{ steps.frontend.outputs.repo }}
+          ref: ${{ steps.frontend.outputs.ref }}
           path: frontend
           token: ${{ secrets.FRONTEND_TOKEN || github.token }}
 
