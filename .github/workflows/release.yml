@@ -5,8 +5,8 @@ name: Release
 #
 # A release build looks for a frontend tag carrying the same name as the backend
 # tag, so shipping a release is one tag on each repository rather than a submodule
-# bump commit on the backend. The submodule pin is the fallback for when no such
-# frontend tag exists.
+# bump commit on the backend. Without such a tag it builds the newest frontend
+# commit instead.
 on:
   push:
     tags:
@@ -63,13 +63,8 @@ jobs:
       #
       # The revision is the frontend tag whose name matches the backend tag, which
       # makes a release "tag both repositories the same". When that tag is absent the
-      # submodule pin is used instead, so a release is never blocked on the frontend
-      # having been tagged -- it just ships the revision the backend records.
-      #
-      # Only the repository is inspected here, not the tag: actions/checkout already
-      # fails with "couldn't find remote ref" when the ref is missing, which is
-      # louder than a silent fallback would be. The exception is an explicit override,
-      # where the requested ref is taken at face value.
+      # newest commit in the repository is used, so a release is never blocked on the
+      # frontend having been tagged.
       - name: Resolve frontend revision
         id: frontend
         env:
@@ -94,10 +89,9 @@ jobs:
           # Derive the default repository from the submodule rather than hardcoding it.
           url="$(git config -f .gitmodules submodule.frontend.url)"
           repo="$(printf '%s' "$url" | sed -E 's#^https://[^/]+/##; s#^git@[^:]+:##; s#\.git$##')"
-          pin="$(git rev-parse "HEAD:frontend")"
 
-          if [ -z "$repo" ] || [ -z "$pin" ]; then
-            echo "::error::could not derive the frontend repository or pin from the submodule"
+          if [ -z "$repo" ]; then
+            echo "::error::could not derive the frontend repository from the submodule"
             exit 1
           fi
 
@@ -116,12 +110,40 @@ jobs:
             echo "ref=$TAG" >> "$GITHUB_OUTPUT"
             echo "source=tag" >> "$GITHUB_OUTPUT"
             echo "Using frontend tag ${TAG} from ${repo}."
-          else
-            echo "repo=$repo" >> "$GITHUB_OUTPUT"
-            echo "ref=$pin" >> "$GITHUB_OUTPUT"
-            echo "source=pin" >> "$GITHUB_OUTPUT"
-            echo "::warning::no frontend tag ${TAG} in ${repo}; falling back to the pinned submodule commit ${pin}."
+            exit 0
           fi
+
+          # No matching tag: fall back to the newest commit in the repository, taken
+          # across all of its branches rather than just the default one. The default
+          # branch is regularly behind the branch the frontend is developed on, so
+          # following it would ship assets older than the backend they accompany.
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+
+          git -C "$work" init -q
+          git -C "$work" remote add origin "$probe"
+          if ! git -C "$work" fetch -q --filter=blob:none --no-tags origin \
+                 '+refs/heads/*:refs/remotes/origin/*'; then
+            echo "::error::no frontend tag ${TAG} in ${repo} and its branches could not be read"
+            exit 1
+          fi
+
+          newest_ref="$(git -C "$work" for-each-ref --sort=-committerdate \
+            --format='%(refname:short)' refs/remotes/origin | head -n 1)"
+          newest="$(git -C "$work" for-each-ref --sort=-committerdate \
+            --format='%(objectname)' refs/remotes/origin | head -n 1)"
+
+          if [ -z "$newest" ] || [ -z "$newest_ref" ]; then
+            echo "::error::no frontend tag ${TAG} in ${repo} and it has no branches to fall back to"
+            exit 1
+          fi
+
+          # The branch is reported because the newest commit is not necessarily on the
+          # mainline: any branch with a recent tip can win, including an automated one.
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "ref=$newest" >> "$GITHUB_OUTPUT"
+          echo "source=newest" >> "$GITHUB_OUTPUT"
+          echo "::warning::no frontend tag ${TAG} in ${repo}; falling back to the newest commit ${newest} (${newest_ref})."
 
       # The frontend is checked out into ./frontend because .build/build-assets.sh
       # reads it from there and packs the built assets into
