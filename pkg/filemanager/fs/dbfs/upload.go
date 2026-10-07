@@ -148,6 +148,10 @@ func (f *DBFS) PrepareUpload(ctx context.Context, req *fs.UploadRequest, opts ..
 		encryptMetadata = res
 	}
 
+	// Server side encryption changes the bytes the storage driver reads, so a
+	// client supplied digest no longer describes the object it addresses.
+	req.Props.ClientHash = clientHashForUpload(req.Props.ClientHash, encryptMetadata)
+
 	// validate upload request
 	if err := validateNewFile(req.Props.Uri.Name(), req.Props.Size, policy); err != nil {
 		return nil, err
@@ -467,4 +471,25 @@ func (f *DBFS) CancelUploadSession(ctx context.Context, path *fs.URI, sessionID 
 	}
 
 	return nil, nil, nil
+}
+
+// clientHashForUpload reports the content digest a relayed upload may declare to
+// the storage driver.
+//
+// A client computes the digest over the file it holds. Encryption changes the
+// bytes storage actually receives, whether the browser encrypted them or this
+// server does, so the digest no longer describes the object it would name. A
+// content addressed driver files the object under that digest and refuses a
+// stream that does not hash to it, and even where it would accept the pointer,
+// a later read would decrypt content that was never encrypted.
+//
+// Encrypted uploads therefore declare no digest. Content addressed drivers fall
+// back to buffering the stream to learn the digest of what they actually
+// received, which is self consistent and always correct.
+func clientHashForUpload(clientHash string, encryptMetadata *types.EncryptMetadata) string {
+	if encryptMetadata != nil {
+		return ""
+	}
+
+	return clientHash
 }
