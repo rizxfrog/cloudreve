@@ -300,3 +300,14 @@ func TestFifoAckIsNoop(t *testing.T) {
 		t.Fatalf("expected no task in queue, got %v", err)
 	}
 }
+
+// suspendingTask suspends once before completing, which is the shape a bulk mail
+// task has while it walks its recipient list.
+type suspendingTask struct {
+	*fakeWorkTask
+}
+
+func (t *suspendingTask) Do(context.Context) (task.Status, error) {
+	t.ResumeAfter(0)
+	return task.StatusSuspending, nil
+}

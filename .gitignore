@@ -39,3 +39,4 @@ tmp/
 cloudreve
 .DS_Store
 /.env.dev
+/.run/Cloudreve_v4.run.xml

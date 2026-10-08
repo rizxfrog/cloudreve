@@ -116,6 +116,30 @@ func AdminSendTestMail(c *gin.Context) {
 	c.JSON(200, serializer.Response{})
 }
 
+// AdminPreviewBulkMail resolves a recipient filter to its audience.
+func AdminPreviewBulkMail(c *gin.Context) {
+	service := ParametersFromContext[*admin.BulkMailRecipientService](c, admin.BulkMailRecipientParamCtx{})
+	res, err := service.Preview(c)
+	if err != nil {
+		c.JSON(200, serializer.Err(c, err))
+		return
+	}
+
+	c.JSON(200, serializer.Response{Data: res})
+}
+
+// AdminSendBulkMail queues a message for the filtered audience.
+func AdminSendBulkMail(c *gin.Context) {
+	service := ParametersFromContext[*admin.SendBulkMailService](c, admin.SendBulkMailParamCtx{})
+	res, err := service.Send(c)
+	if err != nil {
+		c.JSON(200, serializer.Err(c, err))
+		return
+	}
+
+	c.JSON(200, serializer.Response{Data: res})
+}
+
 func AdminCreatePolicy(c *gin.Context) {
 	service := ParametersFromContext[*admin.CreateStoragePolicyService](c, admin.CreateStoragePolicyParamCtx{})
 	res, err := service.Create(c)

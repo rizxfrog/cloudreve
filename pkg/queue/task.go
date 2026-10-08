@@ -104,6 +104,8 @@ const (
 	RelocateTaskType              = "relocate"
 	RemoteDownloadTaskType        = "remote_download"
 	ImportTaskType                = "import"
+	// BulkMailTaskType delivers one message to a filtered set of users.
+	BulkMailTaskType = "bulk_mail"
 
 	FullTextIndexTaskType       = "full_text_index"
 	FullTextCopyTaskType        = "full_text_copy"

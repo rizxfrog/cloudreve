@@ -67,6 +67,15 @@ type SMTP struct {
 	Keepalive       int
 }
 
+// Configured reports whether enough is set for a send to be attempted.
+//
+// The driver builds a client from these fields regardless, so an unset host
+// produces a send failure per recipient. A bulk send checks this first so an
+// obviously misconfigured site is told once instead of once per user.
+func (s *SMTP) Configured() bool {
+	return s != nil && s.Host != "" && s.From != ""
+}
+
 type TokenAuth struct {
 	AccessTokenTTL  time.Duration
 	RefreshTokenTTL time.Duration

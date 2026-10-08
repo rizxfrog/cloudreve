@@ -696,7 +696,7 @@ func (d *dependency) IoIntenseQueue(ctx context.Context) queue.Queue {
 		queue.WithWorkerCount(queueSetting.WorkerNum),
 		queue.WithName("IoIntenseQueue"),
 		queue.WithMaxTaskExecution(queueSetting.MaxExecution),
-		queue.WithResumeTaskType(queue.CreateArchiveTaskType, queue.ExtractArchiveTaskType, queue.RelocateTaskType, queue.ImportTaskType),
+		queue.WithResumeTaskType(queue.CreateArchiveTaskType, queue.ExtractArchiveTaskType, queue.RelocateTaskType, queue.ImportTaskType, queue.BulkMailTaskType),
 		queue.WithTaskPullInterval(10 * time.Second),
 	}
 	opts = append(opts, d.queueStreamOptions(queueSetting.WorkerNum)...)

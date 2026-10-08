@@ -13,11 +13,14 @@ import (
 	"strings"
 	"time"
 
+	"entgo.io/ent/dialect"
+	"entgo.io/ent/dialect/sql"
 	"github.com/cloudreve/Cloudreve/v4/ent"
 	"github.com/cloudreve/Cloudreve/v4/ent/davaccount"
 	"github.com/cloudreve/Cloudreve/v4/ent/file"
 	"github.com/cloudreve/Cloudreve/v4/ent/oauthgrant"
 	"github.com/cloudreve/Cloudreve/v4/ent/passkey"
+	"github.com/cloudreve/Cloudreve/v4/ent/predicate"
 	"github.com/cloudreve/Cloudreve/v4/ent/schema"
 	"github.com/cloudreve/Cloudreve/v4/ent/task"
 	"github.com/cloudreve/Cloudreve/v4/ent/user"
@@ -102,6 +105,11 @@ type (
 		CountByTimeRange(ctx context.Context, start, end *time.Time) (int, error)
 		// ListUsers list users with pagination.
 		ListUsers(ctx context.Context, args *ListUserParameters) (*ListUserResult, error)
+		// ListUsersAfterID enumerates users ordered by ID, returning up to Limit
+		// users with an ID greater than AfterID.
+		ListUsersAfterID(ctx context.Context, args *ListUserAfterIDParameters) ([]*ent.User, error)
+		// CountUsers counts the users matching a filter.
+		CountUsers(ctx context.Context, filter UserFilter) (int, error)
 		// Upsert upserts a user.
 		Upsert(ctx context.Context, u *ent.User, password, twoFa string) (*ent.User, error)
 		// Delete deletes a user.
@@ -109,12 +117,34 @@ type (
 		// CalculateStorage calculate user's storage from scratch and update user's storage.
 		CalculateStorage(ctx context.Context, uid int) (int64, error)
 	}
+	// UserFilter narrows a user query.
+	//
+	// It is shared by the paginated listing an administrator browses and the
+	// cursor based enumeration a bulk send walks, so both agree on which users
+	// match a set of conditions.
+	UserFilter struct {
+		GroupIDs []int         `json:"group_ids,omitempty"`
+		Statuses []user.Status `json:"statuses,omitempty"`
+		Nick     string        `json:"nick,omitempty"`
+		Email    string        `json:"email,omitempty"`
+		// EmailSuffixes keeps users whose address ends with any of the given
+		// suffixes. Empty means no restriction.
+		EmailSuffixes []string `json:"email_suffixes,omitempty"`
+		// NotEmailSuffixes drops users whose address ends with any of the given
+		// suffixes.
+		NotEmailSuffixes []string `json:"not_email_suffixes,omitempty"`
+	}
 	ListUserParameters struct {
 		*PaginationArgs
-		GroupID int
-		Status  user.Status
-		Nick    string
-		Email   string
+		UserFilter
+	}
+	ListUserAfterIDParameters struct {
+		// AfterID is the exclusive lower bound on user ID, used as a stable
+		// cursor: a page based walk over a set that is being written to can
+		// skip or repeat rows.
+		AfterID int
+		Limit   int
+		UserFilter
 	}
 	ListUserResult struct {
 		*PaginationResults
@@ -513,20 +543,126 @@ func (c *userClient) AnonymousUser(ctx context.Context) (*ent.User, error) {
 	return anonymous, nil
 }
 
+// userFilterPredicates translates a UserFilter into query predicates.
+//
+// The suffix match is case-folded by hand rather than with a generated
+// predicate: ent exposes HasSuffix for the email column but no folding variant,
+// and "ends with @example.com" must match "@Example.COM" for the same reason the
+// email condition is already folding.
+func userFilterPredicates(filter UserFilter) []predicate.User {
+	var preds []predicate.User
+	if len(filter.GroupIDs) > 0 {
+		preds = append(preds, user.GroupUsersIn(filter.GroupIDs...))
+	}
+	if len(filter.Statuses) > 0 {
+		preds = append(preds, user.StatusIn(filter.Statuses...))
+	}
+	if filter.Nick != "" {
+		preds = append(preds, user.NickContainsFold(filter.Nick))
+	}
+	if filter.Email != "" {
+		preds = append(preds, user.EmailContainsFold(filter.Email))
+	}
+
+	if len(filter.EmailSuffixes) > 0 {
+		suffixes := make([]predicate.User, 0, len(filter.EmailSuffixes))
+		for _, suffix := range filter.EmailSuffixes {
+			if suffix == "" {
+				continue
+			}
+			suffixes = append(suffixes, userHasSuffixFold(suffix))
+		}
+		if len(suffixes) > 0 {
+			preds = append(preds, user.Or(suffixes...))
+		}
+	}
+
+	if len(filter.NotEmailSuffixes) > 0 {
+		suffixes := make([]predicate.User, 0, len(filter.NotEmailSuffixes))
+		for _, suffix := range filter.NotEmailSuffixes {
+			if suffix == "" {
+				continue
+			}
+			suffixes = append(suffixes, userHasSuffixFold(suffix))
+		}
+		if len(suffixes) > 0 {
+			preds = append(preds, user.Not(user.Or(suffixes...)))
+		}
+	}
+
+	return preds
+}
+
+// userHasSuffixFold builds a case-folded "ends with" test on the email column.
+//
+// ent generates EmailHasSuffix but no folding variant, and "ends with
+// @example.com" has to match "@Example.COM" for the same reason the email
+// condition already folds.
+//
+// The match mirrors sql.ContainsFold, which solves this same dialect trilemma:
+// MySQL folds with a collation, PostgreSQL with ILIKE, and SQLite with LOWER().
+// The argument is bound through Builder.Arg rather than written as a literal "?"
+// so the driver receives the placeholder its dialect expects -- PostgreSQL
+// numbers arguments as $n and lib/pq cannot bind a bare "?".
+func userHasSuffixFold(suffix string) predicate.User {
+	return func(s *sql.Selector) {
+		col := s.C(user.FieldEmail)
+		word, escaped := escapeLikeLiteral(strings.ToLower(suffix))
+		s.Where(sql.P(func(b *sql.Builder) {
+			switch s.Dialect() {
+			case dialect.MySQL:
+				// We assume the CHARACTER SET is configured to utf8mb4,
+				// because this is how it is defined in dialect/sql/schema.
+				b.Ident(col).WriteString(" COLLATE utf8mb4_general_ci LIKE ")
+				b.Arg("%" + word)
+			case dialect.Postgres:
+				b.Ident(col).WriteString(" ILIKE ")
+				b.Arg("%" + word)
+			default: // SQLite.
+				var f sql.Func
+				f.SetDialect(s.Dialect())
+				f.Lower(col)
+				b.WriteString(f.String()).WriteString(" LIKE ")
+				b.Arg("%" + word)
+				if escaped {
+					b.WriteString(` ESCAPE '\'`)
+				}
+			}
+		}))
+	}
+}
+
+// escapeLikeLiteral escapes the LIKE metacharacters in word with a backslash.
+//
+// The second return value reports whether it had to escape anything, which is
+// what decides if a SQLite query needs an ESCAPE clause: MySQL and PostgreSQL
+// treat a backslash as the escape character by default, so adding one there
+// would be redundant.
+func escapeLikeLiteral(word string) (string, bool) {
+	var count int
+	for i := range word {
+		if c := word[i]; c == '%' || c == '_' || c == '\\' {
+			count++
+		}
+	}
+	if count == 0 {
+		return word, false
+	}
+
+	var b strings.Builder
+	b.Grow(len(word) + count)
+	for _, c := range word {
+		if c == '%' || c == '_' || c == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(c)
+	}
+
+	return b.String(), true
+}
+
 func (c *userClient) ListUsers(ctx context.Context, args *ListUserParameters) (*ListUserResult, error) {
-	query := c.client.User.Query()
-	if args.GroupID != 0 {
-		query = query.Where(user.GroupUsers(args.GroupID))
-	}
-	if args.Status != "" {
-		query = query.Where(user.StatusEQ(args.Status))
-	}
-	if args.Nick != "" {
-		query = query.Where(user.NickContainsFold(args.Nick))
-	}
-	if args.Email != "" {
-		query = query.Where(user.EmailContainsFold(args.Email))
-	}
+	query := c.client.User.Query().Where(userFilterPredicates(args.UserFilter)...)
 	query.Order(getUserOrderOption(args)...)
 
 	// Count total items
@@ -548,6 +684,19 @@ func (c *userClient) ListUsers(ctx context.Context, args *ListUserParameters) (*
 		},
 		Users: users,
 	}, nil
+}
+
+func (c *userClient) ListUsersAfterID(ctx context.Context, args *ListUserAfterIDParameters) ([]*ent.User, error) {
+	query := c.client.User.Query().Where(userFilterPredicates(args.UserFilter)...)
+	if args.AfterID > 0 {
+		query = query.Where(user.IDGT(args.AfterID))
+	}
+
+	return withUserEagerLoading(ctx, query).Order(user.ByID()).Limit(args.Limit).All(ctx)
+}
+
+func (c *userClient) CountUsers(ctx context.Context, filter UserFilter) (int, error) {
+	return c.client.User.Query().Where(userFilterPredicates(filter)...).Count(ctx)
 }
 
 func (c *userClient) Upsert(ctx context.Context, u *ent.User, password, twoFa string) (*ent.User, error) {

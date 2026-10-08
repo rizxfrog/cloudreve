@@ -946,6 +946,17 @@ func initMasterRouter(dep dependency.Dep) *gin.Engine {
 						controllers.FromJSON[adminsvc.TestSMTPService](adminsvc.TestSMTPParamCtx{}),
 						controllers.AdminSendTestMail,
 					)
+					// Preview the audience a bulk message would reach
+					tool.POST("mail/recipients",
+						controllers.FromJSON[adminsvc.BulkMailRecipientService](adminsvc.BulkMailRecipientParamCtx{}),
+						controllers.AdminPreviewBulkMail,
+					)
+					// Send a message to a filtered set of users
+					tool.POST("mail/send",
+						middleware.RequiredScopes(types.ScopeAdminWrite),
+						controllers.FromJSON[adminsvc.SendBulkMailService](adminsvc.SendBulkMailParamCtx{}),
+						controllers.AdminSendBulkMail,
+					)
 					tool.DELETE("entityUrlCache",
 						middleware.RequiredScopes(types.ScopeAdminWrite),
 						controllers.AdminClearEntityUrlCache,

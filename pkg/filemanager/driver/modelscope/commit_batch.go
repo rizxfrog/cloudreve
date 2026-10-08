@@ -55,11 +55,14 @@ type commitBatcher struct {
 	// keeps a burst from accumulating without bound.
 	ops chan batchOp
 
-	// mu guards write. The write is refreshed on every driver construction so a
-	// policy edit (rotated token, changed revision) takes effect even though the
-	// merge loop outlives any single client.
-	mu    sync.Mutex
-	write func(context.Context, []map[string]any) error
+	// mu guards write and the merge window. Both are refreshed on every driver
+	// construction so a policy edit (rotated token, changed revision, resized
+	// window) takes effect even though the merge loop outlives any single
+	// client.
+	mu        sync.Mutex
+	write     func(context.Context, []map[string]any) error
+	minWindow time.Duration
+	maxWindow time.Duration
 
 	// The fields below are owned by the merge loop and are never touched by a
 	// submitter, which is why the pending set needs no lock of its own.
@@ -73,16 +76,18 @@ type batchOp struct {
 	result  chan error
 }
 
-// newCommitBatcher starts a merge loop. write is the current commit writer; it
-// may be replaced later with setWriter.
+// newCommitBatcher starts a merge loop. write is the current commit writer and
+// the window is the current merge window; both may be replaced later.
 func newCommitBatcher(minWindow, maxWindow time.Duration, write func(context.Context, []map[string]any) error, l logging.Logger) *commitBatcher {
 	b := &commitBatcher{
-		ops:   make(chan batchOp),
-		write: write,
-		seen:  make(map[string]struct{}),
+		ops:       make(chan batchOp),
+		write:     write,
+		minWindow: minWindow,
+		maxWindow: maxWindow,
+		seen:      make(map[string]struct{}),
 	}
 
-	go b.loop(minWindow, maxWindow, l)
+	go b.loop(l)
 	return b
 }
 
@@ -94,10 +99,28 @@ func (b *commitBatcher) setWriter(write func(context.Context, []map[string]any) 
 	b.write = write
 }
 
+// setWindow replaces the merge window. The loop reads it when it opens a
+// window, so a resized policy takes effect on the next window rather than
+// requiring a process restart. The window already open keeps the size it was
+// drawn with, which is what its waiting callers were told to expect.
+func (b *commitBatcher) setWindow(minWindow, maxWindow time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.minWindow = minWindow
+	b.maxWindow = maxWindow
+}
+
 func (b *commitBatcher) currentWriter() func(context.Context, []map[string]any) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.write
+}
+
+// currentWindow returns the merge window to draw the next commit window from.
+func (b *commitBatcher) currentWindow() (time.Duration, time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.minWindow, b.maxWindow
 }
 
 // submit hands actions to the merge loop and waits for their outcome. The error
@@ -125,7 +148,10 @@ func (b *commitBatcher) submit(ctx context.Context, actions []map[string]any) er
 
 // loop is the single owner of the pending set. It collects actions until the
 // current window elapses or the batch is full, then writes one commit.
-func (b *commitBatcher) loop(minWindow, maxWindow time.Duration, l logging.Logger) {
+//
+// The window is read from the batcher each time a new window opens, so a policy
+// edit that resizes it takes effect without a restart.
+func (b *commitBatcher) loop(l logging.Logger) {
 	var (
 		timer   *time.Timer
 		timeout <-chan time.Time
@@ -168,7 +194,9 @@ func (b *commitBatcher) loop(minWindow, maxWindow time.Duration, l logging.Logge
 			if timeout == nil {
 				// This action opens a new window. Its duration is drawn once and
 				// applies to the whole batch, so every caller merged into it
-				// waits the same bounded time.
+				// waits the same bounded time. The range is read per window, so
+				// a resized policy applies from the next one on.
+				minWindow, maxWindow := b.currentWindow()
 				timer = time.NewTimer(randomInterval(minWindow, maxWindow))
 				timeout = timer.C
 			}
@@ -258,8 +286,9 @@ type batchBatcherRegistry struct {
 var sharedCommitBatchers = &batchBatcherRegistry{batchers: make(map[string]*commitBatcher)}
 
 // forRepository returns the merge loop of key, creating and starting it with
-// the given writer on first use. An existing loop keeps its window but adopts
-// the new writer.
+// the given writer and window on first use. An existing loop adopts both, so a
+// policy edit takes effect without a restart while the loop keeps its pending
+// batch and its open window.
 func (r *batchBatcherRegistry) forRepository(key string, minWindow, maxWindow time.Duration,
 	write func(context.Context, []map[string]any) error, l logging.Logger) *commitBatcher {
 	r.mu.Lock()
@@ -273,5 +302,6 @@ func (r *batchBatcherRegistry) forRepository(key string, minWindow, maxWindow ti
 	}
 
 	batcher.setWriter(write)
+	batcher.setWindow(minWindow, maxWindow)
 	return batcher
 }

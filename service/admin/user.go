@@ -48,15 +48,18 @@ func (service *AdminListService) Users(c *gin.Context) (*ListUserResponse, error
 	ctx := context.WithValue(c, inventory.LoadUserGroup{}, true)
 	ctx = context.WithValue(ctx, inventory.LoadUserPasskey{}, true)
 
-	var (
-		err     error
-		groupID int
-	)
-	if service.Conditions[userGroupCondition] != "" {
-		groupID, err = strconv.Atoi(service.Conditions[userGroupCondition])
+	var groupIDs []int
+	if rawGroupID := service.Conditions[userGroupCondition]; rawGroupID != "" {
+		groupID, err := strconv.Atoi(rawGroupID)
 		if err != nil {
 			return nil, serializer.NewError(serializer.CodeParamErr, "Invalid group ID", err)
 		}
+		groupIDs = []int{groupID}
+	}
+
+	var statuses []user.Status
+	if rawStatus := service.Conditions[userStatusCondition]; rawStatus != "" {
+		statuses = []user.Status{user.Status(rawStatus)}
 	}
 
 	res, err := userClient.ListUsers(ctx, &inventory.ListUserParameters{
@@ -66,10 +69,12 @@ func (service *AdminListService) Users(c *gin.Context) (*ListUserResponse, error
 			OrderBy:  service.OrderBy,
 			Order:    inventory.OrderDirection(service.OrderDirection),
 		},
-		Status:  user.Status(service.Conditions[userStatusCondition]),
-		GroupID: groupID,
-		Nick:    service.Conditions[userNickCondition],
-		Email:   service.Conditions[userEmailCondition],
+		UserFilter: inventory.UserFilter{
+			GroupIDs: groupIDs,
+			Statuses: statuses,
+			Nick:     service.Conditions[userNickCondition],
+			Email:    service.Conditions[userEmailCondition],
+		},
 	})
 
 	if err != nil {

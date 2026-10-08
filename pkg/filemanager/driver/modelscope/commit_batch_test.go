@@ -142,6 +142,37 @@ func TestBatchDelaysCallerUntilWindowCloses(t *testing.T) {
 	require.Len(t, recorder.starts, 1)
 }
 
+// The merge loop outlives any single client, so a client built after a policy
+// edit has to push the new window into the loop it reuses. Without that, a
+// resized window would only take effect after a restart — the loop would keep
+// the range it was created with.
+func TestBatchAdoptsResizedWindowWithoutRestart(t *testing.T) {
+	recorder := &commitRecorder{}
+	endpoint := testEndpoint(t)
+
+	// This client creates the shared loop with a short window.
+	first := newTestClient(t, endpoint)
+	first.api.Transport = recorder.transport(t)
+	first.SetCommitBatch(20*time.Millisecond, 20*time.Millisecond)
+	require.NoError(t, first.Commit(context.Background(),
+		[]map[string]any{blobAction(ObjectPath("00", testHash), testHash, 1024)}))
+
+	// A policy edit resizes the window. The next request builds its own client,
+	// which is handed the loop created above and must carry the new range.
+	long := 400 * time.Millisecond
+	second := newTestClient(t, endpoint)
+	second.api.Transport = recorder.transport(t)
+	second.SetCommitBatch(long, long)
+
+	path := ObjectPath("00", shaOf(t, []byte("resized")))
+	started := time.Now()
+	require.NoError(t, second.Commit(context.Background(),
+		[]map[string]any{blobAction(path, HashFromObjectPath(path), 1024)}))
+
+	require.GreaterOrEqual(t, time.Since(started), long-testWindowSlack,
+		"a resized merge window must apply to the next window, not require a restart")
+}
+
 // Once a window has closed, a later commit must open a new one rather than be
 // appended to a batch that has already been written.
 func TestBatchSeparatesCommitsAcrossWindows(t *testing.T) {

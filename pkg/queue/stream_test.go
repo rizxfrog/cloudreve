@@ -52,6 +52,9 @@ type fakeTaskClient struct {
 	mu      sync.Mutex
 	tasks   map[int]*ent.Task
 	claimed map[int]int
+	// failOn, when set, makes Update reject that many transitions to that status.
+	failOn        task.Status
+	failRemaining int
 }
 
 func newFakeTaskClient(tasks ...*ent.Task) *fakeTaskClient {
@@ -128,6 +131,11 @@ func (f *fakeTaskClient) New(_ context.Context, args *inventory.TaskArgs) (*ent.
 func (f *fakeTaskClient) Update(_ context.Context, model *ent.Task, args *inventory.TaskArgs) (*ent.Task, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if f.failOn != "" && args.Status == f.failOn && f.failRemaining > 0 {
+		f.failRemaining--
+		return nil, fmt.Errorf("simulated failure persisting transition to %q", args.Status)
+	}
 
 	f.applyArgs(model, args)
 	return model, nil
@@ -690,4 +698,13 @@ func pendingCount(t *testing.T, conn redis.Conn, stream string) int {
 	}
 
 	return count
+}
+
+// UpdateFailTimes makes Update reject the next n transitions to the given status,
+// standing in for a transient database failure on the persist path.
+func (f *fakeTaskClient) UpdateFailTimes(status task.Status, n int) {
+	f.mu.Lock()
+	f.failOn = status
+	f.failRemaining = n
+	f.mu.Unlock()
 }

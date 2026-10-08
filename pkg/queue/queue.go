@@ -335,11 +335,54 @@ func (q *queue) work(t Task) {
 
 		// iteration completes
 		t.OnIterationComplete(time.Since(timeIterationStart))
-		_ = q.transitStatus(ctx, t, next)
+		// The state that would have been recorded is lost with this iteration, so
+		// the task is kept right here rather than being left to the scheduler.
+		//
+		// It cannot simply be re-queued: the row still says processing, and the
+		// scheduler only lets such a task be claimed when the entry carrying it was
+		// known to be abandoned, so the advertisement would be discarded and the
+		// task stranded. It also cannot be acknowledged and forgotten, for the same
+		// reason. Holding the worker until the write lands is what keeps the task
+		// reachable; the loop is bounded by the task's own execution budget.
+		if err := q.transitStatus(ctx, t, next); err != nil && shouldRetryTransition(t, next, err) {
+			b := &backoff.Backoff{Max: q.backoffMaxDuration, Factor: q.backoffFactor}
+			for attempt := 0; ; attempt++ {
+				if atomic.LoadInt32(&q.stopFlag) == 1 || ctx.Err() != nil {
+					break
+				}
+
+				delay := q.retryDelay
+				if delay == 0 {
+					delay = b.ForAttempt(float64(attempt))
+				}
+				l.Warning("Retrying to record local state for task %d in %s: %s", t.ID(), delay, err)
+				time.Sleep(delay)
+
+				if err = q.transitStatus(ctx, t, next); err == nil {
+					l.Info("Recorded local state for task %d after retrying", t.ID())
+					break
+				}
+			}
+		}
 		if next != task.StatusProcessing {
 			break
 		}
 	}
+}
+
+// shouldRetryTransition reports whether a task whose state transition failed can
+// be left for another iteration.
+//
+// Only a task that asked to be resumed may be: the transition it lost is the one
+// that records how far it got, and its resume time keeps the retry from becoming
+// a busy loop. A terminal outcome is not retryable here, because re-running work
+// that already happened is worse than a stuck record.
+func shouldRetryTransition(t Task, next task.Status, err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return next == task.StatusSuspending && t.ResumeTime() > 0
 }
 
 func (q *queue) run(ctx context.Context, t Task) (task.Status, error) {
